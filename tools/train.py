@@ -39,6 +39,8 @@ def main():
         set_run_dir(args.run_dir)
     cfg.run_dir = args.run_dir
 
+    os.makedirs(cfg.run_dir, exist_ok=True)
+
     # dump config
     cfg.dump(os.path.join(cfg.run_dir, "configs.yaml"))
 

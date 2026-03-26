@@ -1,0 +1,478 @@
+# ============================================================
+# BEVFusion  |  Bench2Drive  |  Camera + LiDAR  |  ConvFuser
+# ============================================================
+# Requires b2d_infos_*.pkl generated WITH --lidar flag by
+# bench2drive_converter.py (LiDAR .npy files must be present).
+#
+# Usage:
+#   torchpack dist-run -np 8 python tools/train.py \
+#       configs/bench2drive/det/centerhead/lssfpn/camera+lidar/convfuser.yaml
+# ============================================================
+
+dataset_type: Bench2DriveDataset
+dataset_root: data/bench2drive/
+info_root: data/infos/
+
+point_cloud_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+voxel_size: [0.1, 0.1, 0.2]
+image_size: [256, 704]
+
+# B2D LiDAR .npy files: shape [N, 4] = [x, y, z, intensity]
+load_dim: 4
+use_dim: 4
+reduce_beams: 32
+load_augmented: null
+
+augment2d:
+  resize: [[0.38, 0.55], [0.48, 0.48]]
+  rotate: [-5.4, 5.4]
+  gridmask:
+    prob: 0.0
+    fixed_prob: true
+
+augment3d:
+  scale: [0.9, 1.1]
+  rotate: [-0.78539816, 0.78539816]
+  translate: 0.5
+
+object_classes:
+  - car
+  - van
+  - truck
+  - bicycle
+  - traffic_sign
+  - traffic_cone
+  - traffic_light
+  - pedestrian
+  - others
+
+eval_cfg:
+  dist_ths: [0.5, 1.0, 2.0, 4.0]
+  dist_th_tp: 2.0
+  min_recall: 0.1
+  min_precision: 0.1
+  mean_ap_weight: 5
+  class_names:
+    - car
+    - van
+    - truck
+    - bicycle
+    - traffic_sign
+    - traffic_cone
+    - traffic_light
+    - pedestrian
+  tp_metrics:
+    - trans_err
+    - scale_err
+    - orient_err
+    - vel_err
+  err_name_maping:
+    trans_err: mATE
+    scale_err: mASE
+    orient_err: mAOE
+    vel_err: mAVE
+    attr_err: mAAE
+  class_range:
+    car: [50, 50]
+    van: [50, 50]
+    truck: [50, 50]
+    bicycle: [40, 40]
+    traffic_sign: [30, 30]
+    traffic_cone: [30, 30]
+    traffic_light: [30, 30]
+    pedestrian: [40, 40]
+
+input_modality:
+  use_lidar: true
+  use_camera: true
+  use_radar: false
+  use_map: false
+  use_external: false
+
+train_pipeline:
+  -
+    type: LoadMultiViewImageFromFiles
+    to_float32: true
+  -
+    type: LoadPointsFromFile
+    coord_type: LIDAR
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    load_augmented: ${load_augmented}
+  -
+    # B2D has no multi-sweep LiDAR; pad with the keyframe
+    type: LoadPointsFromMultiSweeps
+    sweeps_num: 0
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    pad_empty_sweeps: true
+    remove_close: true
+    load_augmented: ${load_augmented}
+  -
+    # B2D raw .npy points are in CARLA LiDAR frame, but lidar2ego / GT boxes
+    # expect Frame_L (X,Y swapped). This aligns loaded points.
+    type: SwapLiDARXY
+  -
+    type: LoadAnnotations3D
+    with_bbox_3d: true
+    with_label_3d: true
+    with_attr_label: False
+  -
+    type: ImageAug3D
+    final_dim: ${image_size}
+    resize_lim: ${augment2d.resize[0]}
+    bot_pct_lim: [0.0, 0.0]
+    rot_lim: ${augment2d.rotate}
+    rand_flip: true
+    is_train: true
+  -
+    type: GlobalRotScaleTrans
+    resize_lim: ${augment3d.scale}
+    rot_lim: ${augment3d.rotate}
+    trans_lim: ${augment3d.translate}
+    is_train: true
+  -
+    type: RandomFlip3D
+  -
+    type: PointsRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ObjectRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ObjectNameFilter
+    classes: ${object_classes}
+  -
+    type: ImageNormalize
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  -
+    type: GridMask
+    use_h: true
+    use_w: true
+    max_epoch: ${max_epochs}
+    rotate: 1
+    offset: false
+    ratio: 0.5
+    mode: 1
+    prob: ${augment2d.gridmask.prob}
+    fixed_prob: ${augment2d.gridmask.fixed_prob}
+  -
+    type: PointShuffle
+  -
+    type: DefaultFormatBundle3D
+    classes: ${object_classes}
+  -
+    type: Collect3D
+    keys:
+      - img
+      - points
+      - gt_bboxes_3d
+      - gt_labels_3d
+    meta_keys:
+      - camera_intrinsics
+      - camera2ego
+      - lidar2ego
+      - lidar2camera
+      - camera2lidar
+      - lidar2image
+      - img_aug_matrix
+      - lidar_aug_matrix
+  -
+    type: GTDepth
+    keyframe_only: true
+
+test_pipeline:
+  -
+    type: LoadMultiViewImageFromFiles
+    to_float32: true
+  -
+    type: LoadPointsFromFile
+    coord_type: LIDAR
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    load_augmented: ${load_augmented}
+  -
+    type: LoadPointsFromMultiSweeps
+    sweeps_num: 0
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    pad_empty_sweeps: true
+    remove_close: true
+    load_augmented: ${load_augmented}
+  -
+    type: SwapLiDARXY
+  -
+    type: LoadAnnotations3D
+    with_bbox_3d: true
+    with_label_3d: true
+    with_attr_label: False
+  -
+    type: ImageAug3D
+    final_dim: ${image_size}
+    resize_lim: ${augment2d.resize[1]}
+    bot_pct_lim: [0.0, 0.0]
+    rot_lim: [0.0, 0.0]
+    rand_flip: false
+    is_train: false
+  -
+    type: GlobalRotScaleTrans
+    resize_lim: [1.0, 1.0]
+    rot_lim: [0.0, 0.0]
+    trans_lim: 0.0
+    is_train: false
+  -
+    type: PointsRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ImageNormalize
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  -
+    type: DefaultFormatBundle3D
+    classes: ${object_classes}
+  -
+    type: Collect3D
+    keys:
+      - img
+      - points
+      - gt_bboxes_3d
+      - gt_labels_3d
+    meta_keys:
+      - camera_intrinsics
+      - camera2ego
+      - lidar2ego
+      - lidar2camera
+      - camera2lidar
+      - lidar2image
+      - img_aug_matrix
+      - lidar_aug_matrix
+  -
+    type: GTDepth
+    keyframe_only: true
+
+model:
+  type: BEVFusion
+  encoders:
+    camera:
+      backbone:
+        type: ResNet
+        depth: 50
+        num_stages: 4
+        out_indices: [0, 1, 2, 3]
+        norm_cfg:
+          type: BN2d
+          requires_grad: true
+        norm_eval: false
+        init_cfg:
+          type: Pretrained
+          checkpoint: torchvision://resnet50
+      neck:
+        type: SECONDFPN
+        in_channels: [256, 512, 1024, 2048]
+        out_channels: [128, 128, 128, 128]
+        upsample_strides: [0.25, 0.5, 1, 2]
+      vtransform:
+        type: LSSTransform
+        in_channels: 512
+        out_channels: 80
+        image_size: ${image_size}
+        feature_size: ${[image_size[0] // 16, image_size[1] // 16]}
+        xbound: [-51.2, 51.2, 0.8]
+        ybound: [-51.2, 51.2, 0.8]
+        zbound: [-10.0, 10.0, 20.0]
+        dbound: [1.0, 60.0, 1.0]
+        downsample: 1
+    lidar:
+      voxelize:
+        max_num_points: 10
+        point_cloud_range: ${point_cloud_range}
+        voxel_size: ${voxel_size}
+        max_voxels: [90000, 120000]
+      backbone:
+        type: SparseEncoder
+        in_channels: ${use_dim}
+        sparse_shape: [1024, 1024, 41]
+        output_channels: 128
+        order: [conv, norm, act]
+        encoder_channels: [[16, 16, 32], [32, 32, 64], [64, 64, 128], [128, 128]]
+        encoder_paddings: [[0, 0, 1], [0, 0, 1], [0, 0, [1, 1, 0]], [0, 0]]
+        block_type: basicblock
+  fuser:
+    type: ConvFuser
+    in_channels: [80, 256]
+    out_channels: 256
+  decoder:
+    backbone:
+      type: GeneralizedResNet
+      in_channels: 256
+      blocks:
+        - [2, 128, 2]
+        - [2, 256, 2]
+        - [2, 512, 1]
+    neck:
+      type: LSSFPN
+      in_indices: [-1, 0]
+      in_channels: [512, 128]
+      out_channels: 256
+      scale_factor: 2
+  heads:
+    object:
+      type: CenterHead
+      in_channels: 256
+      train_cfg:
+        point_cloud_range: ${point_cloud_range}
+        grid_size: [1024, 1024, 1]
+        voxel_size: ${voxel_size}
+        out_size_factor: 8
+        dense_reg: 1
+        gaussian_overlap: 0.1
+        max_objs: 500
+        min_radius: 2
+        code_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+      test_cfg:
+        post_center_limit_range: [-61.2, -61.2, -10.0, 61.2, 61.2, 10.0]
+        max_per_img: 500
+        max_pool_nms: false
+        min_radius: [4, 12, 10, 1, 0.85, 0.85, 0.85, 0.175, 0.175]
+        score_threshold: 0.1
+        out_size_factor: 8
+        voxel_size: ${voxel_size[:2]}
+        nms_type:
+          - circle
+          - circle
+          - circle
+          - circle
+          - circle
+          - circle
+          - circle
+          - rotate
+          - rotate
+        nms_scale:
+          - [1.0]
+          - [1.0]
+          - [1.0]
+          - [1.0]
+          - [1.0]
+          - [1.0]
+          - [1.0]
+          - [1.0]
+          - [1.0]
+        pre_max_size: 1000
+        post_max_size: 83
+        nms_thr: 0.2
+      # B2D 9-class task grouping
+      tasks:
+        - ["car"]
+        - ["van"]
+        - ["truck"]
+        - ["bicycle"]
+        - ["traffic_sign"]
+        - ["traffic_cone"]
+        - ["traffic_light"]
+        - ["pedestrian"]
+        - ["others"]
+      common_heads:
+        reg: [2, 2]
+        height: [1, 2]
+        dim: [3, 2]
+        rot: [2, 2]
+        vel: [2, 2]
+      share_conv_channel: 64
+      bbox_coder:
+        type: CenterPointBBoxCoder
+        pc_range: ${point_cloud_range}
+        post_center_range: [-61.2, -61.2, -10.0, 61.2, 61.2, 10.0]
+        max_num: 500
+        score_threshold: 0.1
+        out_size_factor: 8
+        voxel_size: ${voxel_size[:2]}
+        code_size: 9
+      separate_head:
+        type: SeparateHead
+        init_bias: -2.19
+        final_kernel: 3
+      loss_cls:
+        type: GaussianFocalLoss
+        reduction: mean
+      loss_bbox:
+        type: L1Loss
+        reduction: mean
+        loss_weight: 0.25
+      norm_bbox: true
+    map: null
+
+max_epochs: 20
+
+optimizer:
+  type: AdamW
+  lr: 2.0e-4
+  weight_decay: 0.01
+  paramwise_cfg:
+    custom_keys:
+      absolute_pos_embed:
+        decay_mult: 0
+      relative_position_bias_table:
+        decay_mult: 0
+      encoders.camera.backbone:
+        lr_mult: 0.1
+
+optimizer_config:
+  grad_clip:
+    max_norm: 35
+    norm_type: 2
+
+lr_config:
+  policy: CosineAnnealing
+  warmup: linear
+  warmup_iters: 500
+  warmup_ratio: 0.33333333
+  min_lr_ratio: 1.0e-3
+
+data:
+  samples_per_gpu: 4
+  workers_per_gpu: 4
+  train:
+    type: CBGSDataset
+    dataset:
+      type: ${dataset_type}
+      dataset_root: ${dataset_root}
+      ann_file: ${info_root + "b2d_infos_train.pkl"}
+      pipeline: ${train_pipeline}
+      object_classes: ${object_classes}
+      modality: ${input_modality}
+      eval_cfg: ${eval_cfg}
+      test_mode: false
+      use_valid_flag: false
+      with_velocity: true
+      box_type_3d: LiDAR
+  val:
+    type: ${dataset_type}
+    dataset_root: ${dataset_root}
+    ann_file: ${info_root + "b2d_infos_val.pkl"}
+    pipeline: ${test_pipeline}
+    object_classes: ${object_classes}
+    modality: ${input_modality}
+    eval_cfg: ${eval_cfg}
+    test_mode: false
+    with_velocity: true
+    box_type_3d: LiDAR
+  test:
+    type: ${dataset_type}
+    dataset_root: ${dataset_root}
+    ann_file: ${info_root + "b2d_infos_val.pkl"}
+    pipeline: ${test_pipeline}
+    object_classes: ${object_classes}
+    modality: ${input_modality}
+    eval_cfg: ${eval_cfg}
+    test_mode: true
+    with_velocity: true
+    box_type_3d: LiDAR
+
+evaluation:
+  interval: 1
+  pipeline: ${test_pipeline}

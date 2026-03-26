@@ -1,6 +1,7 @@
 import argparse
 
 from data_converter import nuscenes_converter as nuscenes_converter
+from data_converter import bench2drive_converter as bench2drive_converter
 from data_converter.create_gt_database import create_groundtruth_database
 
 
@@ -51,6 +52,27 @@ def nuscenes_data_prep(
     )
 
 
+def bench2drive_data_prep(root_path, out_dir, split_file, workers=4, with_lidar=True):
+    """Prepare data related to Bench2Drive dataset.
+
+    Generates b2d_infos_train.pkl and b2d_infos_val.pkl in out_dir.
+
+    Args:
+        root_path (str): Root path of Bench2Drive dataset.
+        out_dir (str): Output directory for info pkl files.
+        split_file (str): Path to bench2drive_base_train_val_split.json.
+        workers (int): Number of parallel worker processes.
+        with_lidar (bool): Whether to include LiDAR file paths in the info.
+    """
+    bench2drive_converter.create_bench2drive_infos(
+        data_root=root_path,
+        out_dir=out_dir,
+        split_file=split_file,
+        workers=workers,
+        with_lidar=with_lidar,
+    )
+
+
 parser = argparse.ArgumentParser(description="Data converter arg parser")
 parser.add_argument("dataset", metavar="kitti", help="name of the dataset")
 parser.add_argument(
@@ -85,6 +107,22 @@ parser.add_argument("--painted", default=False, action="store_true")
 parser.add_argument("--virtual", default=False, action="store_true")
 parser.add_argument(
     "--workers", type=int, default=4, help="number of threads to be used"
+)
+# Bench2Drive specific args
+parser.add_argument(
+    "--split-file",
+    type=str,
+    default=None,
+    help=(
+        "Path to bench2drive_base_train_val_split.json "
+        "(required when dataset=bench2drive)"
+    ),
+)
+parser.add_argument(
+    "--no-lidar",
+    action="store_true",
+    default=False,
+    help="Bench2Drive: skip LiDAR path generation (camera-only mode)",
 )
 args = parser.parse_args()
 
@@ -127,4 +165,20 @@ if __name__ == "__main__":
             out_dir=args.out_dir,
             max_sweeps=args.max_sweeps,
             load_augmented=load_augmented,
+        )
+    elif args.dataset == "bench2drive":
+        import os
+        split_file = args.split_file
+        if split_file is None:
+            split_file = os.path.join(
+                args.root_path,
+                "splits",
+                "bench2drive_base_train_val_split.json",
+            )
+        bench2drive_data_prep(
+            root_path=args.root_path,
+            out_dir=args.out_dir,
+            split_file=split_file,
+            workers=args.workers,
+            with_lidar=not args.no_lidar,
         )

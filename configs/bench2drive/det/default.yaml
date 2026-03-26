@@ -1,0 +1,8 @@
+# Detection task default for Bench2Drive
+# Disables map segmentation head (no BEV map in B2D)
+model:
+  type: BEVFusion
+  encoders: null
+  fuser: null
+  heads:
+    map: null

@@ -4,6 +4,7 @@ from mmdet.core.bbox.match_costs import build_match_cost
 from mmdet.core.bbox.match_costs.builder import MATCH_COST
 from mmdet.core.bbox.iou_calculators import build_iou_calculator
 import torch
+import warnings
 
 try:
     from scipy.optimize import linear_sum_assignment
@@ -121,6 +122,18 @@ class HungarianAssigner3D(BaseAssigner):
 
         # 3. do Hungarian matching on CPU using linear_sum_assignment
         cost = cost.detach().cpu()
+        # Skip sample if cost matrix contains NaN/Inf (corrupted predictions)
+        if torch.isnan(cost).any() or torch.isinf(cost).any():
+            warnings.warn(
+                f'NaN/Inf detected in cost matrix '
+                f'(shape={cost.shape}, '
+                f'nan={torch.isnan(cost).sum().item()}, '
+                f'inf={torch.isinf(cost).sum().item()}). '
+                f'Skipping this sample, assigning all to background.')
+            assigned_gt_inds[:] = 0
+            return AssignResult(
+                num_gts, assigned_gt_inds, torch.zeros_like(iou.max(1).values),
+                labels=assigned_labels)
         if linear_sum_assignment is None:
             raise ImportError('Please run "pip install scipy" '
                               'to install scipy first.')

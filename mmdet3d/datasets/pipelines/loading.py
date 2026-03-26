@@ -142,6 +142,13 @@ class LoadPointsFromMultiSweeps:
             )
         elif lidar_path.endswith(".npy"):
             points = np.load(lidar_path)
+        elif lidar_path.endswith(".laz") or lidar_path.endswith(".las"):
+            import laspy
+            las = laspy.read(lidar_path)
+            intensity = np.array(las.intensity, dtype=np.float32)
+            points = np.stack(
+                [las.x, las.y, las.z, intensity], axis=-1
+            ).astype(np.float32)
         else:
             points = np.fromfile(lidar_path, dtype=np.float32)
         return points
@@ -184,7 +191,8 @@ class LoadPointsFromMultiSweeps:
         """
         points = results["points"]
         points = points[:, self.use_dim]
-        points.tensor[:, 4] = 0
+        if points.tensor.shape[1] > 4:
+            points.tensor[:, 4] = 0
         sweep_points_list = [points]
         ts = results["timestamp"] / 1e6
         if self.pad_empty_sweeps and len(results["sweeps"]) == 0:
@@ -377,6 +385,13 @@ class LoadPointsFromFile:
             )
         elif lidar_path.endswith(".npy"):
             points = np.load(lidar_path)
+        elif lidar_path.endswith(".laz") or lidar_path.endswith(".las"):
+            import laspy
+            las = laspy.read(lidar_path)
+            intensity = np.array(las.intensity, dtype=np.float32)
+            points = np.stack(
+                [las.x, las.y, las.z, intensity], axis=-1
+            ).astype(np.float32)
         else:
             points = np.fromfile(lidar_path, dtype=np.float32)
 

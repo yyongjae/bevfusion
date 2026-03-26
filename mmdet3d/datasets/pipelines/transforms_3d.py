@@ -49,7 +49,7 @@ class GTDepth:
         points = data['points'].data 
         img = data['img'].data
 
-        if self.keyframe_only:
+        if self.keyframe_only and points.shape[1] > 4:
             points = points[points[:, 4] == 0]
 
         batch_size = len(points)
@@ -60,7 +60,7 @@ class GTDepth:
 
         # inverse aug
         cur_coords -= bev_aug_matrix[:3, 3]
-        cur_coords = torch.inverse(bev_aug_matrix[:3, :3]).matmul(
+        cur_coords = torch.linalg.inv(bev_aug_matrix[:3, :3]).matmul(
             cur_coords.transpose(1, 0)
         )
         # lidar2image
@@ -1088,4 +1088,21 @@ class ImageDistort:
                 img = img[..., random.permutation(3)]
             new_imgs.append(img)
         data["img"] = new_imgs
+        return data
+
+
+@PIPELINES.register_module()
+class SwapLiDARXY:
+    """Swap X and Y coordinates of LiDAR points.
+
+    Bench2Drive raw .npy LiDAR files are in CARLA's raw LiDAR frame,
+    but the converter's lidar2ego / GT boxes expect points in Frame_L
+    (= lefthand_ego_to_lidar @ CARLA_LiDAR), which swaps X and Y.
+    This transform aligns the loaded points with the expected frame.
+    """
+
+    def __call__(self, data):
+        points = data["points"]
+        points.tensor[:, [0, 1]] = points.tensor[:, [1, 0]]
+        data["points"] = points
         return data

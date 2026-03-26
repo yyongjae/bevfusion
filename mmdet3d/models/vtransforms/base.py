@@ -35,7 +35,7 @@ class BaseTransform(nn.Module):
         use_points='lidar', 
         depth_input='scalar',
         height_expand=True,
-        add_depth_features=True,
+        add_depth_features=False,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -104,7 +104,7 @@ class BaseTransform(nn.Module):
         # B x N x D x H x W x 3
         points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)
         points = (
-            torch.inverse(post_rots)
+            torch.linalg.inv(post_rots)
             .view(B, N, 1, 1, 1, 3, 3)
             .matmul(points.unsqueeze(-1))
         )
@@ -116,7 +116,7 @@ class BaseTransform(nn.Module):
             ),
             5,
         )
-        combine = camera2lidar_rots.matmul(torch.inverse(intrins))
+        combine = camera2lidar_rots.matmul(torch.linalg.inv(intrins))
         points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
         points += camera2lidar_trans.view(B, N, 1, 1, 1, 3)
 
@@ -288,7 +288,7 @@ class BaseDepthTransform(BaseTransform):
 
             # inverse aug
             cur_coords -= cur_lidar_aug_matrix[:3, 3]
-            cur_coords = torch.inverse(cur_lidar_aug_matrix[:3, :3]).matmul(
+            cur_coords = torch.linalg.inv(cur_lidar_aug_matrix[:3, :3]).matmul(
                 cur_coords.transpose(1, 0)
             )
             # lidar2image

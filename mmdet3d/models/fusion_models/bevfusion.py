@@ -374,6 +374,14 @@ class BEVFusion(Base3DFusionModel):
                                 "labels_3d": labels.cpu(),
                             }
                         )
+                    # Also store raw head outputs for distillation caching
+                    raw_keys = ["dense_heatmap", "heatmap", "center",
+                                "height", "dim", "rot", "vel"]
+                    raw = pred_dict[0]
+                    for k in range(batch_size):
+                        for rk in raw_keys:
+                            if rk in raw:
+                                outputs[k][rk] = raw[rk][k].cpu().half()
                 elif type == "map":
                     logits = head(x)
                     for k in range(batch_size):

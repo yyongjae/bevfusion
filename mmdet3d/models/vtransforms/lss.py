@@ -59,7 +59,7 @@ class LSSTransform(BaseTransform):
             self.downsample = nn.Identity()
 
     @force_fp32()
-    def get_cam_feats(self, x):
+    def get_cam_feats(self, x, mats_dict=None):
         B, N, C, fH, fW = x.shape
 
         x = x.view(B * N, C, fH, fW)

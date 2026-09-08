@@ -167,6 +167,34 @@ class TransFusionHead(nn.Module):
         y_size = self.test_cfg["grid_size"][1] // self.test_cfg["out_size_factor"]
         self.bev_pos = self.create_2D_grid(x_size, y_size)
 
+        # Optional region of interest for query initialisation. The BEV encoder
+        # still runs over the whole `point_cloud_range` -- rear context feeds
+        # the sparse convolutions and the dense heatmap is still supervised
+        # everywhere -- but proposals are drawn only from `bev_roi`, so the
+        # decoder spends its whole budget where the downstream planner looks.
+        # This is the BEVFusion analogue of WoTE/TransFuser encoding +-32 m and
+        # rasterising only the forward half of the BEV.
+        # Format: [x_min, y_min, x_max, y_max] in metres; None = whole grid.
+        roi = self.test_cfg.get("bev_roi", None)
+        if roi is None:
+            self.bev_roi_mask = None
+        else:
+            voxel_size = self.test_cfg["voxel_size"]
+            out_size_factor = self.test_cfg["out_size_factor"]
+            pc_range = self.test_cfg["pc_range"]
+            xs = (torch.arange(x_size).float() + 0.5) * (
+                voxel_size[0] * out_size_factor
+            ) + pc_range[0]
+            ys = (torch.arange(y_size).float() + 0.5) * (
+                voxel_size[1] * out_size_factor
+            ) + pc_range[1]
+            mask = ((xs >= roi[0]) & (xs <= roi[2]))[:, None] & (
+                (ys >= roi[1]) & (ys <= roi[3])
+            )[None, :]
+            self.register_buffer(
+                "bev_roi_mask", mask[None, None].float(), persistent=False
+            )
+
         self.img_feat_pos = None
         self.img_feat_collapsed_pos = None
 
@@ -238,12 +266,21 @@ class TransFusionHead(nn.Module):
         dense_heatmap_img = None
         heatmap = dense_heatmap.detach().sigmoid()
         padding = self.nms_kernel_size // 2
-        local_max = torch.zeros_like(heatmap)
         # equals to nms radius = voxel_size * out_size_factor * kenel_size
-        local_max_inner = F.max_pool2d(
-            heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=0
+        #
+        # NOTE: this used to pool with padding=0 into a zeros_like() buffer,
+        # which left the outermost `padding` ring of local_max at 0. Since
+        # heatmap is a sigmoid (>= 0), `heatmap == local_max` was then False
+        # for every border cell, so any peak landing in the outer ring was
+        # suppressed and could never become a proposal. On nuScenes the ring
+        # sits at +-51.2 m, past every class_range, so it is invisible; on a
+        # tight BEV box it deletes real objects (measured on NAVSIM: vehicle
+        # recall 0.08 in the outer ring vs 0.87 one cell in). Pooling with
+        # padding=`padding` gives the true local max everywhere and is
+        # bit-identical in the interior.
+        local_max = F.max_pool2d(
+            heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=padding
         )
-        local_max[:, :, padding:(-padding), padding:(-padding)] = local_max_inner
         ## for Pedestrian & Traffic_cone in nuScenes
         num_cls = heatmap.shape[1]
         if self.test_cfg["dataset"] == "nuScenes":
@@ -275,7 +312,23 @@ class TransFusionHead(nn.Module):
                 :,
                 7,
             ] = F.max_pool2d(heatmap[:, 7], kernel_size=1, stride=1, padding=0)
+        elif self.test_cfg["dataset"] == "NAVSIM":
+            # small objects: pedestrian, traffic_cone, barrier, czone_sign,
+            # generic_object -- see NAVSIM_CLASSES in navsim_dataset.py
+            for idx in (1, 3, 4, 5, 6):
+                if num_cls > idx:
+                    local_max[
+                        :,
+                        idx,
+                    ] = F.max_pool2d(
+                        heatmap[:, idx], kernel_size=1, stride=1, padding=0
+                    )
         heatmap = heatmap * (heatmap == local_max)
+
+        # restrict query initialisation to the region of interest
+        if self.bev_roi_mask is not None:
+            heatmap = heatmap * self.bev_roi_mask.to(heatmap.dtype)
+
         heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
 
         # top #num_proposals among all classes
@@ -546,8 +599,13 @@ class TransFusionHead(nn.Module):
         feature_map_size = (
             grid_size[:2] // self.train_cfg["out_size_factor"]
         )  # [x_len, y_len]
+        # NOTE: the gaussians below are drawn at center_int[[1, 0]], i.e. the
+        # row index is coor_x and the column index is coor_y, matching the
+        # predicted dense_heatmap whose spatial dims are (x / factor,
+        # y / factor).  The allocation must follow that order or a non-square
+        # BEV grid silently mismatches (it happens to work when x_len == y_len).
         heatmap = gt_bboxes_3d.new_zeros(
-            self.num_classes, feature_map_size[1], feature_map_size[0]
+            self.num_classes, feature_map_size[0], feature_map_size[1]
         )
         for idx in range(len(gt_bboxes_3d)):
             width = gt_bboxes_3d[idx][3]
@@ -788,6 +846,32 @@ class TransFusionHead(nn.Module):
                         num_class=1, class_names=["Pedestrian"], indices=[1], radius=0.7
                     ),
                     dict(num_class=1, class_names=["Cyclist"], indices=[2], radius=0.7),
+                ]
+            elif self.test_cfg["dataset"] == "NAVSIM":
+                self.tasks = [
+                    dict(
+                        num_class=1, class_names=["vehicle"], indices=[0], radius=-1
+                    ),
+                    dict(
+                        num_class=1,
+                        class_names=["pedestrian"],
+                        indices=[1],
+                        radius=0.175,
+                    ),
+                    dict(
+                        num_class=1, class_names=["bicycle"], indices=[2], radius=0.85
+                    ),
+                    dict(
+                        num_class=4,
+                        class_names=[
+                            "traffic_cone",
+                            "barrier",
+                            "czone_sign",
+                            "generic_object",
+                        ],
+                        indices=[3, 4, 5, 6],
+                        radius=0.175,
+                    ),
                 ]
 
             ret_layer = []

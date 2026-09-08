@@ -1,0 +1,48 @@
+# ============================================================
+# BEVFusion | NAVSIM | smoke test (camera+LiDAR)
+# ============================================================
+# Runs the full teacher model over the synthetic dataset produced by
+# tools/make_navsim_smoke_data.py -- real images and calibration, synthetic
+# LiDAR and boxes. Use it to verify the environment and the data plumbing;
+# the numbers it produces are meaningless.
+#
+#   python tools/make_navsim_smoke_data.py \
+#       --map-infos /home/data/navsim_resmap/infos/navsim_map_infos_navtest.pkl \
+#       --sensor-root /home/data/sensor_blobs_800x450 --split test \
+#       --num-frames 64 --val-frames 16 --out-dir data/navsim_smoke
+#   torchpack dist-run -np 1 python tools/train.py \
+#       configs/navsim/det/transfusion/secfpn/camera+lidar/smoke.yaml \
+#       --run-dir runs/navsim-smoke
+# ============================================================
+
+dataset_root: data/navsim_smoke/
+max_epochs: 1
+
+camera_names:
+  - CAM_F0
+  - CAM_L0
+  - CAM_R0
+
+# No nuImages checkpoint is needed for a smoke test.
+model:
+  encoders:
+    camera:
+      backbone:
+        init_cfg: null
+
+log_config:
+  interval: 1
+
+checkpoint_config:
+  interval: 1
+  max_keep_ckpts: 1
+
+data:
+  samples_per_gpu: 2
+  workers_per_gpu: 2
+  train:
+    ann_file: data/navsim_smoke/infos/navsim_infos_smoke_train.pkl
+  val:
+    ann_file: data/navsim_smoke/infos/navsim_infos_smoke_val.pkl
+  test:
+    ann_file: data/navsim_smoke/infos/navsim_infos_smoke_val.pkl

@@ -103,6 +103,12 @@ You can then create a symbolic link `data` to the `/dataset` directory in the do
 
 ### Data Preparation
 
+#### NAVSIM
+
+For the NAVSIM (OpenScene / nuPlan) port used as the BEV distillation teacher,
+see [docs/NAVSIM.md](docs/NAVSIM.md): environment setup, the info converter,
+the LiDAR `.pcd` -> `.bin` step, and the two-stage training recipe.
+
 #### nuScenes
 
 Please follow the instructions from [here](https://github.com/open-mmlab/mmdetection3d/blob/master/docs/en/datasets/nuscenes_det.md) to download and preprocess the nuScenes dataset. Please remember to download both detection dataset and the map extension (for BEV map segmentation). After data preparation, you will be able to see the following directory structure (as is indicated in mmdetection3d):

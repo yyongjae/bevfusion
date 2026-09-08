@@ -3,7 +3,12 @@ import os
 import numpy as np
 import torch
 
-__all__ = ["load_augmented_point_cloud", "reduce_LiDAR_beams"]
+__all__ = [
+    "load_augmented_point_cloud",
+    "reduce_LiDAR_beams",
+    "read_pcd",
+    "load_pcd_point_cloud",
+]
 
 
 def load_augmented_point_cloud(path, virtual=False, reduce_beams=32):
@@ -105,3 +110,140 @@ def reduce_LiDAR_beams(pts, reduce_beams_to=32):
     # print(points.size())
     return points.numpy()
 
+
+
+# --------------------------------------------------------------------------- #
+# PCD reader
+#
+# NAVSIM ships its merged point clouds as PCD rather than the raw float32 dumps
+# nuScenes uses.  Reading them directly avoids duplicating the whole LiDAR set
+# on disk -- the NAVSIM encoding (float32 xyz + uint8 intensity/lidar_info/ring
+# = 15 bytes/point) is actually *denser* than a float32 .bin would be.
+# --------------------------------------------------------------------------- #
+
+_PCD_NUMPY_TYPE = {
+    ("F", 4): "f4", ("F", 8): "f8",
+    ("U", 1): "u1", ("U", 2): "u2", ("U", 4): "u4", ("U", 8): "u8",
+    ("I", 1): "i1", ("I", 2): "i2", ("I", 4): "i4", ("I", 8): "i8",
+}
+
+
+def _lzf_decompress(data, expected_len):
+    """Pure-python LZF decompression (fallback when python-lzf is absent)."""
+    out = bytearray()
+    i, n = 0, len(data)
+    while i < n:
+        ctrl = data[i]
+        i += 1
+        if ctrl < 32:  # literal run
+            out += data[i : i + ctrl + 1]
+            i += ctrl + 1
+        else:
+            length = ctrl >> 5
+            if length == 7:
+                length += data[i]
+                i += 1
+            ref = len(out) - ((ctrl & 0x1F) << 8) - data[i] - 1
+            i += 1
+            if ref < 0:
+                raise ValueError("invalid LZF stream")
+            for _ in range(length + 2):
+                out.append(out[ref])
+                ref += 1
+    if len(out) != expected_len:
+        raise ValueError(f"LZF size mismatch: {len(out)} != {expected_len}")
+    return bytes(out)
+
+
+def read_pcd(path):
+    """Read a PCD file into a structured numpy array.
+
+    Supports the ``binary``, ``binary_compressed`` and ``ascii`` encodings and
+    arbitrary field layouts; callers select fields by name.
+    """
+    import struct
+
+    with open(path, "rb") as f:
+        header = {}
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"truncated PCD header: {path}")
+            text = line.decode("utf-8", "replace").strip()
+            if not text or text.startswith("#"):
+                continue
+            key, _, value = text.partition(" ")
+            header[key.upper()] = value.strip()
+            if key.upper() == "DATA":
+                break
+
+        fields = header["FIELDS"].split()
+        sizes = [int(x) for x in header["SIZE"].split()]
+        types = header["TYPE"].split()
+        counts = [
+            int(c)
+            for c in header.get("COUNT", " ".join(["1"] * len(fields))).split()
+        ]
+        n_points = (
+            int(header["POINTS"])
+            if "POINTS" in header
+            else int(header["WIDTH"]) * int(header["HEIGHT"])
+        )
+        data_kind = header["DATA"].lower()
+
+        names, formats = [], []
+        for name, size, typ, count in zip(fields, sizes, types, counts):
+            fmt = _PCD_NUMPY_TYPE[(typ.upper(), size)]
+            names.append(name)
+            formats.append(f"{count}{fmt}" if count > 1 else fmt)
+        dtype = np.dtype({"names": names, "formats": formats})
+
+        if data_kind == "binary":
+            buf = f.read(dtype.itemsize * n_points)
+            return np.frombuffer(buf, dtype=dtype, count=n_points)
+
+        if data_kind == "binary_compressed":
+            comp_len, uncomp_len = struct.unpack("II", f.read(8))
+            payload = f.read(comp_len)
+            try:
+                import lzf
+
+                raw = lzf.decompress(payload, uncomp_len)
+            except ImportError:
+                raw = _lzf_decompress(payload, uncomp_len)
+            # binary_compressed stores the data field-major.
+            out = np.empty(n_points, dtype=dtype)
+            offset = 0
+            for name in dtype.names:
+                sub = dtype[name]
+                nbytes = sub.itemsize * n_points
+                out[name] = np.frombuffer(
+                    raw[offset : offset + nbytes], dtype=sub, count=n_points
+                )
+                offset += nbytes
+            return out
+
+        if data_kind == "ascii":
+            return np.loadtxt(f, dtype=dtype)
+
+        raise ValueError(f"unsupported PCD DATA type: {data_kind}")
+
+
+def load_pcd_point_cloud(path, load_dim=5):
+    """Load a PCD as an ``(N, load_dim)`` float32 array.
+
+    Columns follow the nuScenes layout ``[x, y, z, intensity, ring]``; missing
+    fields are filled with zeros.
+    """
+    arr = read_pcd(path)
+    names = arr.dtype.names
+
+    def col(name):
+        if name in names:
+            return arr[name].astype(np.float32)
+        return np.zeros(len(arr), dtype=np.float32)
+
+    points = np.stack(
+        [col("x"), col("y"), col("z"), col("intensity"), col("ring")], axis=-1
+    )
+    return np.ascontiguousarray(points[:, :load_dim], dtype=np.float32)

@@ -134,7 +134,7 @@ class BaseTransform(nn.Module):
 
         return points
 
-    def get_cam_feats(self, x):
+    def get_cam_feats(self, x, mats_dict=None):
         raise NotImplementedError
 
     @force_fp32()
@@ -189,6 +189,7 @@ class BaseTransform(nn.Module):
         camera2lidar,
         img_aug_matrix,
         lidar_aug_matrix,
+        metas=None,
         **kwargs,
     ):
         rots = camera2ego[..., :3, :3]
@@ -263,25 +264,44 @@ class BaseDepthTransform(BaseTransform):
         camera2lidar_rots = camera2lidar[..., :3, :3]
         camera2lidar_trans = camera2lidar[..., :3, 3]
 
-        if self.use_points == 'radar':
-            points = radar
+        depth_points = radar if self.use_points == 'radar' else points
+        if depth_points is None:
+            raise ValueError(f"{self.use_points} points are required for depth projection")
 
-        if self.height_expand:
-            for b in range(len(points)):
-                points_repeated = points[b].repeat_interleave(8, dim=0)
-                points_repeated[:, 2] = torch.arange(0.25, 2.25, 0.25).repeat(points[b].shape[0])
-                points[b] = points_repeated
+        # Depth projection must not modify the shared input point list.  The same
+        # tensors are consumed by the LiDAR encoder after the camera encoder during
+        # training (and in the opposite order during inference).
+        projected_points = []
+        for cur_points in depth_points:
+            if self.height_expand:
+                original_count = cur_points.shape[0]
+                cur_points = cur_points.repeat_interleave(8, dim=0)
+                heights = torch.arange(
+                    0.25,
+                    2.25,
+                    0.25,
+                    device=cur_points.device,
+                    dtype=cur_points.dtype,
+                )
+                cur_points[:, 2] = heights.repeat(original_count)
+            projected_points.append(cur_points)
 
-        batch_size = len(points)
+        batch_size = len(projected_points)
         depth_in_channels = 1 if self.depth_input=='scalar' else self.D
         if self.add_depth_features:
-            depth_in_channels += points[0].shape[1]
+            depth_in_channels += projected_points[0].shape[1]
 
-        depth = torch.zeros(batch_size, img.shape[1], depth_in_channels, *self.image_size, device=points[0].device)
+        depth = torch.zeros(
+            batch_size,
+            img.shape[1],
+            depth_in_channels,
+            *self.image_size,
+            device=projected_points[0].device,
+        )
 
 
         for b in range(batch_size):
-            cur_coords = points[b][:, :3]
+            cur_coords = projected_points[b][:, :3].clone()
             cur_img_aug_matrix = img_aug_matrix[b]
             cur_lidar_aug_matrix = lidar_aug_matrix[b]
             cur_lidar2image = lidar2image[b]
@@ -326,7 +346,7 @@ class BaseDepthTransform(BaseTransform):
                     depth[b, c, masked_dist.long(), masked_coords[:, 0], masked_coords[:, 1]] = 1.0
 
                 if self.add_depth_features:
-                    depth[b, c, -points[b].shape[-1]:, masked_coords[:, 0], masked_coords[:, 1]] = points[b][boolmask2idx(on_img[c])].transpose(0,1)
+                    depth[b, c, -projected_points[b].shape[-1]:, masked_coords[:, 0], masked_coords[:, 1]] = projected_points[b][boolmask2idx(on_img[c])].transpose(0,1)
 
         extra_rots = lidar_aug_matrix[..., :3, :3]
         extra_trans = lidar_aug_matrix[..., :3, 3]
@@ -359,4 +379,3 @@ class BaseDepthTransform(BaseTransform):
             return x, depth 
         else:
             return x
-

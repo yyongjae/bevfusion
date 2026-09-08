@@ -15,7 +15,11 @@ from mmdet.datasets.pipelines import LoadAnnotations
 
 import torch
 
-from .loading_utils import load_augmented_point_cloud, reduce_LiDAR_beams
+from .loading_utils import (
+    load_augmented_point_cloud,
+    load_pcd_point_cloud,
+    reduce_LiDAR_beams,
+)
 
 
 @PIPELINES.register_module()
@@ -140,6 +144,9 @@ class LoadPointsFromMultiSweeps:
             points = load_augmented_point_cloud(
                 lidar_path, virtual=virtual, reduce_beams=self.reduce_beams
             )
+        elif lidar_path.endswith(".pcd"):
+            # NAVSIM merged point clouds
+            points = load_pcd_point_cloud(lidar_path, self.load_dim)
         elif lidar_path.endswith(".npy"):
             points = np.load(lidar_path)
         elif lidar_path.endswith(".laz") or lidar_path.endswith(".las"):
@@ -383,6 +390,9 @@ class LoadPointsFromFile:
             points = load_augmented_point_cloud(
                 lidar_path, virtual=virtual, reduce_beams=self.reduce_beams
             )
+        elif lidar_path.endswith(".pcd"):
+            # NAVSIM merged point clouds
+            points = load_pcd_point_cloud(lidar_path, self.load_dim)
         elif lidar_path.endswith(".npy"):
             points = np.load(lidar_path)
         elif lidar_path.endswith(".laz") or lidar_path.endswith(".las"):

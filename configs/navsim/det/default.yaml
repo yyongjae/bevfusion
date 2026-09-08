@@ -1,0 +1,9 @@
+# Detection task default for NAVSIM.
+# NAVSIM ships nuPlan map GPKGs rather than rasterised BEV masks, so the
+# map-segmentation head is disabled.
+model:
+  type: BEVFusion
+  encoders: null
+  fuser: null
+  heads:
+    map: null

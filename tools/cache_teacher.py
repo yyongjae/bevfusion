@@ -44,14 +44,16 @@ def parse_args():
                         help="which split to cache (default: train)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--local_rank", type=int, default=0)
-    args = parser.parse_args()
+    # Unknown flags are forwarded to torchpack as config overrides, matching
+    # tools/train.py (e.g. --data.test.load_interval 100).
+    args, opts = parser.parse_known_args()
     if "LOCAL_RANK" not in os.environ:
         os.environ["LOCAL_RANK"] = str(args.local_rank)
-    return args
+    return args, opts
 
 
 def main():
-    args = parse_args()
+    args, opts = parse_args()
     dist.init()
     rank, world_size = get_dist_info()
 
@@ -62,11 +64,16 @@ def main():
 
     # ---- config ----
     configs.load(args.config, recursive=True)
+    configs.update(opts)
     cfg = Config(recursive_eval(configs), filename=args.config)
 
     # ---- dataset ----
     if args.split == "train":
-        cfg.data.test.ann_file = cfg.data.train.dataset.ann_file
+        # data.train is either the dataset itself or a CBGSDataset wrapper.
+        train_cfg = cfg.data.train
+        cfg.data.test.ann_file = train_cfg.get(
+            "dataset", train_cfg
+        )["ann_file"]
 
     cfg.data.test.test_mode = True
     cfg.data.test.pop("samples_per_gpu", None)
@@ -83,7 +90,8 @@ def main():
 
     # ---- model ----
     cfg.model.train_cfg = None
-    cfg.model.encoders.camera.backbone.init_cfg = None
+    if cfg.model.encoders.get("camera") is not None:
+        cfg.model.encoders.camera.backbone.init_cfg = None
     model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
     fp16_cfg = cfg.get("fp16", None)
     if fp16_cfg is not None:
@@ -102,7 +110,18 @@ def main():
     _captured = {}
 
     def _hook_fn(module, inp, output):
-        _captured["pred_dict"] = output
+        raw = output
+        while isinstance(raw, (list, tuple)):
+            raw = raw[0]
+        if not isinstance(raw, dict):
+            raise TypeError(f"unexpected object head output type: {type(raw)}")
+        # TransFusion decoding mutates centre/dimension tensors in place after
+        # this hook returns, so references to the original output are unsafe.
+        _captured["pred_dict"] = {
+            key: raw[key].detach().clone()
+            for key in CACHE_KEYS
+            if key in raw
+        }
 
     hook_handle = model.module.heads["object"].register_forward_hook(_hook_fn)
 
@@ -110,24 +129,19 @@ def main():
     all_outputs = {}
     prog_bar = mmcv.ProgressBar(len(dataset)) if rank == 0 else None
 
-    skipped = 0
     with torch.no_grad():
         for data in data_loader:
             _captured.clear()
             try:
                 model(return_loss=False, rescale=True, **data)
             except Exception as e:
-                skipped += 1
-                if prog_bar is not None:
-                    prog_bar.update()
-                continue
+                raise RuntimeError(
+                    f"teacher inference failed on rank {rank}"
+                ) from e
 
             pred_dict = _captured.get("pred_dict")
             if pred_dict is None:
-                skipped += 1
-                if prog_bar is not None:
-                    prog_bar.update()
-                continue
+                raise RuntimeError("object head hook did not capture predictions")
 
             # Navigate through any list/tuple nesting to reach the actual prediction dict
             raw = pred_dict
@@ -144,7 +158,9 @@ def main():
                 if isinstance(metas, list) and len(metas) > i:
                     token = metas[i].get("token", None)
                 if token is None:
-                    continue
+                    raise RuntimeError(
+                        f"sample metadata has no token on rank {rank}, batch index {i}"
+                    )
 
                 sample = {
                     key: raw[key][i].detach().cpu().half()
@@ -156,9 +172,6 @@ def main():
             if prog_bar is not None:
                 for _ in range(batch_size):
                     prog_bar.update()
-
-    if skipped > 0:
-        print(f"\n[Rank {rank}] Skipped {skipped} batches due to errors")
 
     hook_handle.remove()
 

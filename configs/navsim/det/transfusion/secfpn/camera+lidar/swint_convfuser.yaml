@@ -1,0 +1,29 @@
+# ============================================================
+# BEVFusion | NAVSIM | Camera+LiDAR | front-3 cameras (default)
+# ============================================================
+# The BEV distillation teacher. Uses NAVSIM's standard front view
+# (CAM_F0 + CAM_L0 + CAM_R0) and the same front-only LiDAR/BEV ROI.
+#
+# Stage 1 (LiDAR-only, run this first):
+#   torchpack dist-run -np 2 python tools/train.py \
+#       configs/navsim/det/transfusion/secfpn/lidar/voxelnet.yaml \
+#       --run-dir runs/navsim-lidar-only
+#
+# Stage 2 (this config):
+#   torchpack dist-run -np 2 python tools/train.py \
+#       configs/navsim/det/transfusion/secfpn/camera+lidar/swint_convfuser.yaml \
+#       --model.encoders.camera.backbone.init_cfg.checkpoint \
+#           pretrained/swint-nuimages-pretrained.pth \
+#       --load_from runs/navsim-lidar-only/latest.pth \
+#       --run-dir runs/navsim-fusion
+#
+# Cache the teacher outputs for distillation:
+#   torchpack dist-run -np 2 python tools/cache_teacher.py \
+#       configs/navsim/det/transfusion/secfpn/camera+lidar/swint_convfuser.yaml \
+#       runs/navsim-fusion/latest.pth --cache-dir data/teacher_cache
+# ============================================================
+
+camera_names:
+  - CAM_F0
+  - CAM_L0
+  - CAM_R0

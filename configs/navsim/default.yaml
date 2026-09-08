@@ -1,0 +1,343 @@
+# ============================================================
+# NAVSIM (OpenScene / nuPlan) base configuration for BEVFusion
+#
+# Key differences from the nuScenes default:
+#   - dataset_type: NavsimDataset
+#   - 7 nuPlan object classes
+#   - Ego frame origin is the rear axle, ~0.32 m above the ground, so the
+#     vertical range is [-3, 5] instead of nuScenes' [-5, 3].
+#   - 360-degree BEV, front-only queries. The encoder runs over +-32 m in
+#     both axes -- the extent TransFuser / WoTE / SeerDrive rasterise and the
+#     one PARA-SSR's `pc_range` uses -- and `bev_roi` then restricts query
+#     initialisation to the forward half, the way WoTE encodes +-32 m but
+#     rasterises only x in [0, 32]. Requires the uncropped 360-degree clouds.
+#   - The grid is 100 x 100 at 0.64 m, identical to PARA-SSR's bev_h/bev_w,
+#     so BEV distillation is a crop of this teacher rather than a resample.
+#   - No temporal sweeps (each frame ships one merged point cloud)
+#   - No map segmentation head, no GT-database paste
+#   - Images are stored down-scaled (800x450 from 1920x1080); the resize
+#     limits below are expressed relative to the *stored* size.
+# ============================================================
+
+dataset_type: NavsimDataset
+dataset_root: data/navsim/
+info_root: data/infos/
+max_epochs: 20
+gt_paste_stop_epoch: -1
+reduce_beams: 32
+load_dim: 5        # converted .bin: [x, y, z, intensity, ring]
+use_dim: 5
+load_augmented: null
+sweeps_num: 2
+
+point_cloud_range: [-32.0, -32.0, -3.0, 32.0, 32.0, 5.0]
+
+# Region the detector is actually asked about: the forward half. The encoder
+# still sees all of point_cloud_range -- rear points feed the sparse
+# convolutions and the dense heatmap is supervised everywhere -- but query
+# initialisation, and therefore every cached teacher output, is confined here.
+# [x_min, y_min, x_max, y_max] in metres.
+bev_roi: [0.0, -32.0, 32.0, 32.0]
+voxel_size: [0.08, 0.08, 0.2]   # x8 out_size_factor -> 0.64 m BEV cell
+image_size: [256, 704]
+
+# Cameras fed to the model. NAVSIM's standard front view is the three front
+# cameras; set to null (or list all eight) for full 360 degree coverage.
+camera_names:
+  - CAM_F0
+  - CAM_L0
+  - CAM_R0
+
+# Relative to the stored 800x450 images: 0.88 maps 800 -> 704 (the model
+# width) with no upsampling. Update these if you re-export at another size.
+augment2d:
+  resize: [[0.76, 1.0], [0.88, 0.88]]
+  rotate: [-5.4, 5.4]
+  gridmask:
+    prob: 0.0
+    fixed_prob: true
+
+# With 360-degree clouds the upstream nuScenes augmentation is valid again:
+# the point cloud is rotationally symmetric, so yaw and both mirrors map
+# sensed region onto sensed region. (On the front-cropped clouds this was not
+# true -- the x-flip alone dropped 59% of the points and left 43% of camera
+# views with no LiDAR depth; see git history.)
+augment3d:
+  scale: [0.9, 1.1]
+  rotate: [-0.78539816, 0.78539816]
+  translate: 0.5
+
+# nuPlan TrackedObjectType names, as they appear in anns['gt_names'].
+object_classes:
+  - vehicle
+  - pedestrian
+  - bicycle
+  - traffic_cone
+  - barrier
+  - czone_sign
+  - generic_object
+
+eval_cfg:
+  # Score the queried region only -- rear GT must not count as missed for a
+  # model that was never asked to look there. Mirrors `bev_roi` above; the
+  # per-class distance limits below apply in addition.
+  point_cloud_range: [0.0, -32.0, -3.0, 32.0, 32.0, 5.0]
+  dist_ths: [0.5, 1.0, 2.0, 4.0]
+  dist_th_tp: 2.0
+  min_recall: 0.1
+  min_precision: 0.1
+  mean_ap_weight: 5
+  class_names:
+    - vehicle
+    - pedestrian
+    - bicycle
+    - traffic_cone
+    - barrier
+    - czone_sign
+    - generic_object
+  tp_metrics:
+    - trans_err
+    - scale_err
+    - orient_err
+    - vel_err
+  err_name_maping:
+    trans_err: mATE
+    scale_err: mASE
+    orient_err: mAOE
+    vel_err: mAVE
+    attr_err: mAAE
+  class_range:
+    vehicle: [32, 32]
+    pedestrian: [32, 32]
+    bicycle: [32, 32]
+    traffic_cone: [32, 32]
+    barrier: [32, 32]
+    czone_sign: [32, 32]
+    generic_object: [32, 32]
+
+input_modality:
+  use_lidar: true
+  use_camera: true
+  use_radar: false
+  use_map: false
+  use_external: false
+
+# ------------------------------------------------------------------ #
+# Training pipeline (camera + LiDAR, single sweep, no map segmentation)
+# ------------------------------------------------------------------ #
+train_pipeline:
+  -
+    type: LoadMultiViewImageFromFiles
+    to_float32: true
+  -
+    type: LoadPointsFromFile
+    coord_type: LIDAR
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    load_augmented: ${load_augmented}
+  -
+    # Previous LiDAR frames, transformed into this frame and stamped with
+    # their time offset in channel 4 -- the upstream nuScenes mechanism.
+    # NOTE the temporal scale: nuScenes' 10 sweeps span 0.5 s of 20 Hz LiDAR,
+    # while NAVSIM has no intermediate LiDAR, so 1 sweep already costs 0.5 s
+    # and a median 2.6 m of ego motion. `sweeps_num: 2` keeps roughly the
+    # ego displacement nuScenes accumulates; raise it only after checking
+    # that moving objects do not smear (see docs/NAVSIM.md).
+    type: LoadPointsFromMultiSweeps
+    sweeps_num: ${sweeps_num}
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    pad_empty_sweeps: true
+    remove_close: true
+    load_augmented: ${load_augmented}
+  -
+    type: LoadAnnotations3D
+    with_bbox_3d: true
+    with_label_3d: true
+    with_attr_label: False
+  -
+    type: ImageAug3D
+    final_dim: ${image_size}
+    resize_lim: ${augment2d.resize[0]}
+    bot_pct_lim: [0.0, 0.0]
+    rot_lim: ${augment2d.rotate}
+    rand_flip: true
+    is_train: true
+  -
+    type: GlobalRotScaleTrans
+    resize_lim: ${augment3d.scale}
+    rot_lim: ${augment3d.rotate}
+    trans_lim: ${augment3d.translate}
+    is_train: true
+  -
+    type: RandomFlip3D
+  -
+    type: PointsRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ObjectRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ObjectNameFilter
+    classes: ${object_classes}
+  -
+    type: ImageNormalize
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  -
+    type: GridMask
+    use_h: true
+    use_w: true
+    max_epoch: ${max_epochs}
+    rotate: 1
+    offset: false
+    ratio: 0.5
+    mode: 1
+    prob: ${augment2d.gridmask.prob}
+    fixed_prob: ${augment2d.gridmask.fixed_prob}
+  -
+    type: PointShuffle
+  -
+    type: DefaultFormatBundle3D
+    classes: ${object_classes}
+  -
+    type: Collect3D
+    keys:
+      - img
+      - points
+      - gt_bboxes_3d
+      - gt_labels_3d
+    meta_keys:
+      - camera_intrinsics
+      - camera2ego
+      - lidar2ego
+      - lidar2camera
+      - camera2lidar
+      - lidar2image
+      - img_aug_matrix
+      - lidar_aug_matrix
+  -
+    type: GTDepth
+    keyframe_only: true
+
+# ------------------------------------------------------------------ #
+# Test / validation pipeline
+# ------------------------------------------------------------------ #
+test_pipeline:
+  -
+    type: LoadMultiViewImageFromFiles
+    to_float32: true
+  -
+    type: LoadPointsFromFile
+    coord_type: LIDAR
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    load_augmented: ${load_augmented}
+  -
+    type: LoadPointsFromMultiSweeps
+    sweeps_num: ${sweeps_num}
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    pad_empty_sweeps: true
+    remove_close: true
+    load_augmented: ${load_augmented}
+  -
+    type: LoadAnnotations3D
+    with_bbox_3d: true
+    with_label_3d: true
+    with_attr_label: False
+  -
+    type: ImageAug3D
+    final_dim: ${image_size}
+    resize_lim: ${augment2d.resize[1]}
+    bot_pct_lim: [0.0, 0.0]
+    rot_lim: [0.0, 0.0]
+    rand_flip: false
+    is_train: false
+  -
+    type: GlobalRotScaleTrans
+    resize_lim: [1.0, 1.0]
+    rot_lim: [0.0, 0.0]
+    trans_lim: 0.0
+    is_train: false
+  -
+    type: PointsRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ImageNormalize
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  -
+    type: DefaultFormatBundle3D
+    classes: ${object_classes}
+  -
+    type: Collect3D
+    keys:
+      - img
+      - points
+      - gt_bboxes_3d
+      - gt_labels_3d
+    meta_keys:
+      - camera_intrinsics
+      - camera2ego
+      - lidar2ego
+      - lidar2camera
+      - camera2lidar
+      - lidar2image
+      - img_aug_matrix
+      - lidar_aug_matrix
+  -
+    type: GTDepth
+    keyframe_only: true
+
+fp16:
+  loss_scale: dynamic
+
+data:
+  samples_per_gpu: 4
+  workers_per_gpu: 4
+  train:
+    type: ${dataset_type}
+    dataset_root: ${dataset_root}
+    ann_file: ${info_root + "navsim_infos_train.pkl"}
+    pipeline: ${train_pipeline}
+    object_classes: ${object_classes}
+    camera_names: ${camera_names}
+    modality: ${input_modality}
+    eval_cfg: ${eval_cfg}
+    test_mode: false
+    use_valid_flag: true
+    with_velocity: true
+    box_type_3d: LiDAR
+  val:
+    type: ${dataset_type}
+    dataset_root: ${dataset_root}
+    ann_file: ${info_root + "navsim_infos_val.pkl"}
+    pipeline: ${test_pipeline}
+    object_classes: ${object_classes}
+    camera_names: ${camera_names}
+    modality: ${input_modality}
+    eval_cfg: ${eval_cfg}
+    test_mode: false
+    with_velocity: true
+    box_type_3d: LiDAR
+  test:
+    type: ${dataset_type}
+    dataset_root: ${dataset_root}
+    ann_file: ${info_root + "navsim_infos_val.pkl"}
+    pipeline: ${test_pipeline}
+    object_classes: ${object_classes}
+    camera_names: ${camera_names}
+    modality: ${input_modality}
+    eval_cfg: ${eval_cfg}
+    test_mode: true
+    with_velocity: true
+    box_type_3d: LiDAR
+
+evaluation:
+  interval: 1
+  pipeline: ${test_pipeline}

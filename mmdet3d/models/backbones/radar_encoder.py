@@ -15,7 +15,10 @@ from torchvision.utils import save_image
 from mmdet3d.ops import feature_decorator
 from mmcv.cnn.bricks.non_local import NonLocal2d
 
-from flash_attn.flash_attention import FlashMHA
+try:
+    from flash_attn.flash_attention import FlashMHA
+except ImportError:  # flash-attn is optional: only the radar branch uses it
+    FlashMHA = None
 
 
 __all__ = ["RadarFeatureNet", "RadarEncoder"]

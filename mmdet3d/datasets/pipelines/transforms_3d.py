@@ -322,9 +322,23 @@ class GridMask:
 
 @PIPELINES.register_module()
 class RandomFlip3D:
+    """Random BEV mirroring.
+
+    Args:
+        horizontal (bool): allow the y -> -y flip (left/right mirror).
+        vertical (bool): allow the x -> -x flip (front/back mirror). Disable
+            this whenever the point cloud only covers one half of the BEV --
+            e.g. NAVSIM's front-cropped LiDAR -- since mirroring then moves
+            every point behind the ego, outside the sensed region.
+    """
+
+    def __init__(self, horizontal: bool = True, vertical: bool = True):
+        self.horizontal = horizontal
+        self.vertical = vertical
+
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        flip_horizontal = random.choice([0, 1])
-        flip_vertical = random.choice([0, 1])
+        flip_horizontal = random.choice([0, 1]) if self.horizontal else 0
+        flip_vertical = random.choice([0, 1]) if self.vertical else 0
 
         rotation = np.eye(3)
         if flip_horizontal:

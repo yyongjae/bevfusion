@@ -229,18 +229,18 @@ class BEVFusion(Base3DFusionModel):
     @auto_fp16(apply_to=("img", "points"))
     def forward(
         self,
-        img,
-        points,
-        camera2ego,
-        lidar2ego,
-        lidar2camera,
-        lidar2image,
-        camera_intrinsics,
-        camera2lidar,
-        img_aug_matrix,
-        lidar_aug_matrix,
-        metas,
-        depths,
+        img=None,
+        points=None,
+        camera2ego=None,
+        lidar2ego=None,
+        lidar2camera=None,
+        lidar2image=None,
+        camera_intrinsics=None,
+        camera2lidar=None,
+        img_aug_matrix=None,
+        lidar_aug_matrix=None,
+        metas=None,
+        depths=None,
         radar=None,
         gt_masks_bev=None,
         gt_bboxes_3d=None,
@@ -274,17 +274,17 @@ class BEVFusion(Base3DFusionModel):
     @auto_fp16(apply_to=("img", "points"))
     def forward_single(
         self,
-        img,
-        points,
-        camera2ego,
-        lidar2ego,
-        lidar2camera,
-        lidar2image,
-        camera_intrinsics,
-        camera2lidar,
-        img_aug_matrix,
-        lidar_aug_matrix,
-        metas,
+        img=None,
+        points=None,
+        camera2ego=None,
+        lidar2ego=None,
+        lidar2camera=None,
+        lidar2image=None,
+        camera_intrinsics=None,
+        camera2lidar=None,
+        img_aug_matrix=None,
+        lidar_aug_matrix=None,
+        metas=None,
         depths=None,
         radar=None,
         gt_masks_bev=None,
@@ -365,6 +365,24 @@ class BEVFusion(Base3DFusionModel):
             for type, head in self.heads.items():
                 if type == "object":
                     pred_dict = head(x, metas)
+                    # get_bboxes decodes centres/dimensions in place.  Preserve
+                    # pristine decoder tensors before calling it so distillation
+                    # caches contain the network outputs, not decoded values.
+                    raw = pred_dict
+                    while isinstance(raw, (list, tuple)):
+                        raw = raw[0]
+                    if not isinstance(raw, dict):
+                        raise TypeError(
+                            "unexpected object head output type: "
+                            f"{raw.__class__.__name__}"
+                        )
+                    raw_keys = ["dense_heatmap", "heatmap", "center",
+                                "height", "dim", "rot", "vel"]
+                    raw_outputs = {
+                        key: raw[key].detach().clone()
+                        for key in raw_keys
+                        if key in raw
+                    }
                     bboxes = head.get_bboxes(pred_dict, metas)
                     for k, (boxes, scores, labels) in enumerate(bboxes):
                         outputs[k].update(
@@ -374,14 +392,9 @@ class BEVFusion(Base3DFusionModel):
                                 "labels_3d": labels.cpu(),
                             }
                         )
-                    # Also store raw head outputs for distillation caching
-                    raw_keys = ["dense_heatmap", "heatmap", "center",
-                                "height", "dim", "rot", "vel"]
-                    raw = pred_dict[0]
                     for k in range(batch_size):
-                        for rk in raw_keys:
-                            if rk in raw:
-                                outputs[k][rk] = raw[rk][k].cpu().half()
+                        for rk, raw_value in raw_outputs.items():
+                            outputs[k][rk] = raw_value[k].cpu().half()
                 elif type == "map":
                     logits = head(x)
                     for k in range(batch_size):
@@ -394,4 +407,3 @@ class BEVFusion(Base3DFusionModel):
                 else:
                     raise ValueError(f"unsupported head: {type}")
             return outputs
-

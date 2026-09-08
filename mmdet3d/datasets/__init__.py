@@ -4,5 +4,6 @@ from .builder import *
 from .custom_3d import *
 from .nuscenes_dataset import *
 from .bench2drive_dataset import *
+from .navsim_dataset import *
 from .pipelines import *
 from .utils import *

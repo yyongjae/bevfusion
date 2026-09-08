@@ -44,66 +44,83 @@ radar branch; the import is now optional, so no flash-attn build is required.
 
 ## 2. Data layout
 
+As the ordinary NAVSIM download leaves it -- images and merged point clouds
+share one tree per split:
+
 ```
-/home/data/
-  navsim_logs/
+<openscene>/
+  trainval_navsim_logs/
     trainval/<log_name>.pkl          # 1310 logs, per-frame annotations
+  test_navsim_logs/
     test/<log_name>.pkl              #  147 logs
-  sensor_blobs_800x450/
+  trainval_sensor_blobs/
     trainval/<log_name>/CAM_{F0,L0,L1,L2,R0,R1,R2,B0}/<sample_token>.jpg
-    test/...
-  sensor_blobs_lidar_front/                 # front-cropped LiDAR, see section 4
     trainval/<log_name>/MergedPointCloud/<frame_token>.pcd
+  test_sensor_blobs/
     test/...
-  navsim_resmap/
-    navsim_cfg/train_test_split/scene_filter/{navtrain,navtest}.yaml
   maps/                              # nuPlan GPKG maps (not used by detection)
 ```
 
-Inside the repo:
+The `{navtrain,navtest}.yaml` scene filters live in the navsim repo, under
+`navsim/planning/script/config/common/train_test_split/scene_filter/`.
+
+Inside this repo:
 
 ```
-data/navsim/sensor_blobs -> /home/data/sensor_blobs_800x450
-data/navsim/lidar        -> /home/data/sensor_blobs_lidar_front
+data/navsim/sensor_blobs -> <openscene>/trainval_sensor_blobs
+data/navsim/lidar        -> <openscene>/trainval_sensor_blobs
 data/infos/navsim_infos_{train,val}.pkl
 ```
 
+Both links point at the same tree unless the clouds were exported separately
+(e.g. the front-cropped set described in section 4), in which case `lidar`
+points at that export instead.
+
 ### Image resolution
 
-NAVSIM images are 1920x1080. The stored blobs are 800x450 (exactly 1920/2.4),
-which is **sufficient and requires no re-export**: the model input is 256x704,
-and 800 -> 704 is only a 1.14x downscale, so almost nothing is lost relative to
-feeding the original 1920px frames. `augment2d.resize` in
-`configs/navsim/default.yaml` is expressed relative to the *stored* size
-(`[0.76, 1.0]` train, `0.88` eval), so no upsampling ever happens.
+NAVSIM images are 1920x1080, and that is what the converter and the configs
+now assume. `augment2d.resize` in `configs/navsim/default.yaml` is expressed
+relative to the *stored* size, so at 1920 px it reads `[0.31667, 0.41667]`
+train and `0.36667` eval (`704 / 1920`), and no upsampling ever happens.
+
+An earlier revision of this port ran against an 800x450 re-export with
+`[0.76, 1.0]` / `0.88`. **The two produce identical output sizes** -- 608 px at
+the low end of the training range, 800 px at the high end, 704 px at eval --
+so only the source detail differs, and the 800px numbers remain correct for
+anyone still using that export.
+
+| stored width | train resize | eval resize | resulting width |
+| --- | --- | --- | --- |
+| 1920 (default) | `[0.31667, 0.41667]` | `0.36667` | 608 - 800 px, 704 at eval |
+| 800 | `[0.76, 1.0]` | `0.88` | the same |
 
 If you re-export at another width, pass `--image-width` to the converter (it
-rescales `cam_intrinsic` by `width / 1920`) and update `augment2d.resize` to
-`704 / new_width`.
+rescales `cam_intrinsic` by `width / 1920`) and set `augment2d.resize` eval to
+`704 / new_width`, keeping the training range at the same ratio to it.
 
 ---
 
 ## 3. Building the info files
 
 ```bash
-SF=/home/data/navsim_resmap/navsim_cfg/train_test_split/scene_filter
+SF=<navsim>/navsim/planning/script/config/common/train_test_split/scene_filter
 
 python tools/data_converter/navsim_converter.py \
-    --navsim-logs /home/data/navsim_logs/trainval \
-    --sensor-root /home/data/sensor_blobs_800x450 \
-    --split trainval --image-width 800 \
+    --navsim-logs <openscene>/trainval_navsim_logs/trainval \
+    --sensor-root <openscene>/trainval_sensor_blobs \
+    --split trainval \
     --scene-filter $SF/navtrain.yaml \
     --keyframes-only --check-files --workers 24 \
-    --lidar-prefix lidar --lidar-ext .pcd \
+    --lidar-prefix lidar --lidar-ext .pcd --max-sweeps 2 \
     --out data/infos/navsim_infos_train.pkl
 
 python tools/data_converter/navsim_converter.py \
-    --navsim-logs /home/data/navsim_logs/test \
-    --sensor-root /home/data/sensor_blobs_800x450 \
-    --split test --image-width 800 \
+    --navsim-logs <openscene>/test_navsim_logs/test \
+    --sensor-root <openscene>/test_sensor_blobs \
+    --split test \
     --scene-filter $SF/navtest.yaml \
     --keyframes-only --check-files --workers 24 \
-    --lidar-prefix lidar --lidar-ext .pcd \
+    --lidar-prefix lidar --lidar-ext .pcd --max-sweeps 2 \
     --out data/infos/navsim_infos_val.pkl
 ```
 
@@ -157,36 +174,93 @@ converter with `--lidar-prefix lidar --lidar-ext .pcd`.
 `tools/prune_unused_lidar.py` deletes clouds no info file references (on the
 official split that is 112,183 of 227,617 files, ~86 GB).
 
-### The grid: encode 360 degrees, query the forward half
+### The grid: front only
 
 ```
-point_cloud_range: [-32.0, -32.0, -3.0, 32.0, 32.0, 5.0]
-voxel_size:        [0.08, 0.08, 0.2]      -> 800 x 800 x 40 voxels
-                                          -> 100 x 100 head grid at 0.64 m
-bev_roi:           [0.0, -32.0, 32.0, 32.0]
+point_cloud_range: [0.0, -32.0, -3.0, 32.0, 32.0, 5.0]
+voxel_size:        [0.04, 0.08, 0.2]      -> 800 x 800 x 40 voxels
+                                          -> 100 x 100 head grid
+                                          -> 0.32 m longitudinal, 0.64 m lateral
+bev_roi:           null
 ```
 
-* **The extent is the one every NAVSIM baseline uses.** TransFuser, WoTE and
-  SeerDrive all rasterise LiDAR over `lidar_min/max_x/y = +-32`, and PARA-SSR's
-  `pc_range` is the same box.
-* **The resolution matches PARA-SSR's `bev_h = bev_w = 100`.** At 0.64 m per
-  cell the teacher's forward half lands on the student's BEV one-to-one, so
-  distillation is a crop rather than a resample.
-* **`bev_roi` restricts query initialisation to the forward half** (grid rows
-  50-99). The encoder still runs over the full +-32 m -- rear points feed the
-  sparse convolutions and the dense heatmap is supervised everywhere -- but
-  every proposal, and therefore every cached teacher output, lands in the
-  region the planner reads. This is the BEVFusion analogue of WoTE encoding
-  +-32 m while rasterising only `x in [0, 32]`. Set `bev_roi: null` to query
-  the whole grid.
-* `eval_cfg.point_cloud_range` mirrors `bev_roi` so rear GT is not scored
-  against a model that was never asked to look there.
+* **The ROI is the region the cameras can see.** A three-front-camera teacher
+  has no rear observation, so encoding `x in [-32, 0]` bought supervision the
+  student cannot use and cost roughly half the LiDAR compute: points per sample
+  drop 225k -> 114k and a fp32 iteration (B=4, one RTX 5090) drops 695 -> 448 ms.
+* **The grid matches PARA-SSR one-for-one.** The student's `pc_range` is
+  `(-32, 0, -2, 32, 32, 2)` with `bev_h = bev_w = 100`, i.e. the same 32 m
+  forward / 64 m lateral box at the same 0.32 x 0.64 m cells, so distillation is
+  a straight copy -- no crop, no resample. The axes still differ in convention:
+  mmdet3d LiDAR is x-forward / y-left, the student is y-forward / x-right.
+* **The cells are deliberately non-square.** `sparse_shape` stays
+  `[800, 800, 41]` and `out_size_factor` stays 8, so halving `voxel_size[0]` to
+  0.04 is what turns 32 m of forward extent into 100 cells. This mirrors the
+  student's own "keep 100 x 100 for the first controlled experiment" choice. The
+  square-cell variant both sides plan to ablate is `voxel_size
+  [0.08, 0.08, 0.2]` with `sparse_shape`/`grid_size` `[400, 800, 41]` -> 50 x 100
+  at 0.64 m.
+* **`bev_roi` is no longer needed.** It existed to keep query initialisation in
+  the forward half of a 360-degree grid; the grid is now that half. The head
+  still supports it, so an ROI inside the front region can be set if wanted.
+* `eval_cfg.point_cloud_range` is identical to `point_cloud_range`, so rear GT
+  is not scored against a model that was never asked to look there.
 
-This configuration **requires the uncropped 360-degree clouds.** The
-front-cropped set (`x in [0, 32]`) that produced
-`runs/navsim-fusion/epoch_20.pth` is a different grid; that checkpoint is
-reproduced by pointing `tools/test.py` at the config dumped beside it
-(`runs/navsim-fusion/configs.yaml`), which torchpack loads standalone.
+> Earlier revisions encoded the full 360 degrees and masked the heatmap with
+> `bev_roi` before proposal selection. That kept the rear supervised by LiDAR --
+> about 46% of the labels -- but the masking happened *after* voxelisation and
+> the sparse convolutions, so none of the rear compute was ever saved. Dropping
+> the rear from `point_cloud_range` is what actually makes it cheaper, and the
+> cost is that rear supervision.
+
+### Camera field of view
+
+The ROI is a rectangle, but the three front cameras are not.  Measured from
+the NAVSIM calibration, each has a 63.7 degree horizontal FOV and they sit at
+yaw 0.2 / +55.2 / -55.5 degrees, so together they span **-87.3 to +87.0
+degrees** -- overlapping, with no gap, but 3 degrees short of the 180 degree
+half-plane at each side.
+
+Objects are therefore filtered by **projection**, not by an azimuth threshold:
+a box is kept when at least one of its eight corners projects into one of the
+cameras listed in `camera_names`, with positive depth and a pixel inside the
+image.  This is BEVFormer's `point_sampling` test.  It is not the same as a
+wedge, because the cameras sit off the LiDAR origin -- inside the front-only
+ROI, projection drops 4.4% of boxes where an equivalent +-87 degree wedge drops
+1.6%.
+
+Two places apply it, both driven by `camera_fov` in
+`configs/navsim/default.yaml`:
+
+* `ObjectFOVFilter` in the training pipeline, placed before `ImageAug3D` so the
+  test runs on the raw sensor geometry.  The augmentations rotate the LiDAR
+  frame only virtually -- the model undoes them through `lidar_aug_matrix` when
+  it projects -- so visibility follows an object's original position, and
+  keeping the test pre-augmentation makes the label set identical every epoch.
+* `eval_cfg.camera_fov`, because `NavsimDataset.load_gt` builds the evaluation
+  GT straight from the info files and never runs the pipeline.  Without it the
+  model would be scored on objects the training targets no longer contain.
+
+`camera_fov.apply_within` decides the scope, and the choice matters:
+
+`apply_within` (default `null`) restricts the filter to an
+`[x_min, y_min, x_max, y_max]` box, leaving boxes outside it untouched.  With a
+front-only `point_cloud_range` there is nothing left to protect -- the range
+filters drop the rear regardless -- so `null` is the right default now.  It
+mattered when the grid was 360 degrees: `null` removed 45.6% of the targets
+there (every rear box), against 3.3% for `apply_within: ${bev_roi}`.
+
+`camera_fov.enabled: false` restores the unfiltered behaviour.
+
+**A front-only ROI is not the same thing as front-cropped clouds, and this
+configuration still requires the uncropped 360-degree ones.**  `PointsRangeFilter`
+runs *after* `LoadPointsFromMultiSweeps`, so each sweep is transformed into the
+current frame in full and only the accumulated cloud is cut to
+`point_cloud_range`.  Every sweep therefore covers the whole ROI (see the table
+below).  Pre-cropping the files on disk -- the `x in [0, 32]` set that produced
+`runs/navsim-fusion/epoch_20.pth` -- loses that, and is a different grid besides;
+that checkpoint is reproduced by pointing `tools/test.py` at the config dumped
+beside it (`runs/navsim-fusion/configs.yaml`), which torchpack loads standalone.
 
 ### Multi-sweep
 
@@ -202,17 +276,17 @@ non-keyframes, so 10 of them span 0.5 s. NAVSIM has no intermediate LiDAR, so
 one sweep is already 0.5 s and a median 2.6 m of ego motion (measured over
 10,690 navtest frame pairs; p90 speed 9.3 m/s). `sweeps_num: 2` therefore
 accumulates roughly the ego displacement nuScenes gets from its full stack.
-Going further smears moving objects, and on *cropped* clouds it also opens a
-hole: the previous frame's sensed wedge, transformed into the current frame,
-covers only
+Going further smears moving objects, and on clouds *cropped on disk* it also
+opens a hole: the previous frame's sensed wedge, transformed into the current
+frame, covers only
 
 | sweeps back | 1 | 2 | 4 | 6 | 9 |
 | --- | --- | --- | --- | --- | --- |
 | coverage of the BEV box, cropped clouds | 91% | 81% | 63% | 45% | 19% |
 | coverage, 360-degree clouds | 100% | 100% | 100% | 100% | 100% |
 
-so the sweep stack only makes sense on the uncropped data, which is the other
-reason this config assumes it.
+so the sweep stack only makes sense on the uncropped files, which is the other
+reason this config reads them and crops afterwards.
 
 Note that both the student and the NAVSIM baselines use a *single* LiDAR frame
 (`lidar_seq_len: 1`, `agent_input.lidars[-1]`) and take ego velocity through
@@ -292,7 +366,7 @@ whole loop can be exercised without any point clouds on disk:
 ```bash
 python tools/make_navsim_smoke_data.py \
     --map-infos /home/data/navsim_resmap/infos/navsim_map_infos_navtest.pkl \
-    --sensor-root /home/data/sensor_blobs_800x450 --split test \
+    --sensor-root <openscene>/trainval_sensor_blobs --split test \
     --num-frames 64 --val-frames 16 --out-dir data/navsim_smoke
 
 torchpack dist-run -np 1 python tools/train.py \
@@ -330,3 +404,8 @@ Three edits outside the `navsim_*` files, all additive:
   Bench2Drive configs are unchanged).
 * `mmdet3d/models/backbones/radar_encoder.py` -- the unused `flash_attn`
   import is now optional.
+* `mmdet3d/datasets/fov_utils.py` (new) -- the projection-based visibility test,
+  shared by the pipeline transform and the evaluator.
+* `mmdet3d/datasets/pipelines/transforms_3d.py` -- adds `ObjectFOVFilter`.
+* `mmdet3d/datasets/navsim_dataset.py` -- `load_gt` applies the same test to the
+  evaluation GT via `eval_cfg['camera_fov']`.

@@ -36,17 +36,16 @@ convention used throughout BEVFusion::
 
 Camera intrinsics
 -----------------
-NAVSIM images are 1920x1080.  If the sensor blobs on disk were down-scaled
-(e.g. to 800x450), pass ``--image-width`` so that ``cam_intrinsic`` is scaled
-to match the stored images.
+NAVSIM images are 1920x1080, which is the default here.  If the sensor blobs
+on disk were down-scaled (e.g. to 800x450), pass ``--image-width`` so that
+``cam_intrinsic`` is scaled to match the stored images.
 
 Usage
 -----
     python tools/data_converter/navsim_converter.py \
         --navsim-logs   /path/to/openscene/trainval_navsim_logs \
-        --sensor-root   /home/data/sensor_blobs_800x450 \
+        --sensor-root   /path/to/openscene/trainval_sensor_blobs \
         --split         trainval \
-        --image-width   800 \
         --scene-filter  /home/data/navsim_resmap/navsim_cfg/train_test_split/scene_filter/navtrain.yaml \
         --out           data/infos/navsim_infos_train.pkl
 """
@@ -392,9 +391,9 @@ def parse_args():
                    help="root of the sensor blobs (contains trainval/ and test/)")
     p.add_argument("--split", required=True, choices=["trainval", "test", "mini"])
     p.add_argument("--out", required=True, help="output .pkl path")
-    p.add_argument("--image-width", type=int, default=800,
+    p.add_argument("--image-width", type=int, default=1920,
                    help="width of the stored images; intrinsics are scaled by "
-                        "image-width / 1920 (default: 800)")
+                        "image-width / 1920 (default: 1920, the native size)")
     p.add_argument("--scene-filter", default=None,
                    help="navsim scene_filter yaml, used only for its log_names list")
     p.add_argument("--sensor-prefix", default="sensor_blobs",

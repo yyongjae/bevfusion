@@ -18,6 +18,8 @@ from mmdet3d.core.bbox import (
 )
 from mmdet.datasets.builder import PIPELINES
 
+from ..fov_utils import boxes_in_view
+
 from ..builder import OBJECTSAMPLERS
 from .utils import noise_per_object_v3_
 
@@ -543,6 +545,91 @@ class PointShuffle:
     def __call__(self, data):
         data["points"].shuffle()
         return data
+
+
+@PIPELINES.register_module()
+class ObjectFOVFilter:
+    """Drop GT boxes that no configured camera has observed.
+
+    ``ObjectRangeFilter`` keeps a rectangle, and ``bev_roi`` keeps the forward
+    half, but NAVSIM's three front cameras only span about +-87 degrees, so
+    both still admit boxes the rig never saw.  This filter projects each box
+    into the cameras actually fed to the model and keeps it only if it lands in
+    one of the images.  See :mod:`mmdet3d.datasets.fov_utils` for why the test
+    is by projection rather than by an azimuth threshold, and why it runs
+    before the augmentations.
+
+    Place it directly after ``LoadAnnotations3D``, ahead of ``ImageAug3D``.
+
+    Args:
+        min_visible_corners (int): how many of the eight box corners must land
+            in an image.  Defaults to 1, which keeps boxes clipped by the image
+            border -- still legitimate detection targets.
+        margin (float): pixels of slack outside the image border.
+        enabled (bool): set False to disable without editing the pipeline.
+    """
+
+    def __init__(
+        self, min_visible_corners=1, margin=0.0, enabled=True, apply_within=None
+    ):
+        self.min_visible_corners = int(min_visible_corners)
+        self.margin = float(margin)
+        self.enabled = bool(enabled)
+        # ``[x_min, y_min, x_max, y_max]``: restrict the filter to boxes whose
+        # centre falls in this BEV rectangle, leaving the rest untouched.  With
+        # ``bev_roi`` here the rear keeps its LiDAR-only supervision -- the
+        # dense heatmap stays supervised over the full 360 degrees, as
+        # docs/NAVSIM.md intends -- while the queried front region is trimmed to
+        # what the cameras actually see.  ``None`` filters everywhere, which
+        # makes the label set purely camera-conditioned.
+        self.apply_within = (
+            None if apply_within is None else np.asarray(apply_within, dtype=np.float64)
+        )
+
+    def __call__(self, data):
+        if not self.enabled:
+            return data
+        if "gt_bboxes_3d" not in data or "lidar2image" not in data:
+            return data
+
+        gt_bboxes_3d = data["gt_bboxes_3d"]
+        if len(gt_bboxes_3d) == 0:
+            return data
+
+        width, height = data["ori_shape"]
+        mask = boxes_in_view(
+            gt_bboxes_3d.corners.numpy(),
+            np.asarray(data["lidar2image"], dtype=np.float64),
+            (width, height),
+            min_corners=self.min_visible_corners,
+            margin=self.margin,
+        )
+
+        if self.apply_within is not None:
+            centre = gt_bboxes_3d.gravity_center.numpy()
+            x_min, y_min, x_max, y_max = self.apply_within
+            considered = (
+                (centre[:, 0] >= x_min)
+                & (centre[:, 0] <= x_max)
+                & (centre[:, 1] >= y_min)
+                & (centre[:, 1] <= y_max)
+            )
+            mask |= ~considered
+
+        data["gt_bboxes_3d"] = gt_bboxes_3d[torch.from_numpy(mask)]
+        if "gt_labels_3d" in data:
+            data["gt_labels_3d"] = data["gt_labels_3d"][mask]
+        if "gt_names_3d" in data:
+            data["gt_names_3d"] = np.asarray(data["gt_names_3d"])[mask]
+        return data
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"min_visible_corners={self.min_visible_corners}, "
+            f"margin={self.margin}, enabled={self.enabled}, "
+            f"apply_within={self.apply_within})"
+        )
 
 
 @PIPELINES.register_module()

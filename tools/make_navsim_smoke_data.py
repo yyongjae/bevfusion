@@ -5,8 +5,9 @@ are large downloads.  This script produces a few hundred frames that exercise
 every stage of the training loop *before* that download completes:
 
 * **Real** camera images, intrinsics and extrinsics, taken from the info
-  pickles already on disk (``navsim_map_infos_*.pkl``) and the down-scaled
-  sensor blobs.  Intrinsics are rescaled from 1920 px to the stored width.
+  pickles already on disk (``navsim_map_infos_*.pkl``) and the sensor blobs.
+  Intrinsics are rescaled from 1920 px to the stored width (``--image-width``,
+  1920 by default).
 * **Synthetic** LiDAR and 3D boxes: a ground plane plus a handful of
   box-shaped point clusters, with GT boxes that match those clusters, so the
   detection loss is actually learnable and a falling loss curve means the
@@ -20,7 +21,7 @@ Usage
 -----
     python tools/make_navsim_smoke_data.py \
         --map-infos /home/data/navsim_resmap/infos/navsim_map_infos_navtest.pkl \
-        --sensor-root /home/data/sensor_blobs_800x450 \
+        --sensor-root /path/to/openscene/trainval_sensor_blobs \
         --split test --num-frames 64 --out-dir data/navsim_smoke
 """
 
@@ -173,7 +174,7 @@ def parse_args():
     p.add_argument("--out-dir", default="data/navsim_smoke")
     p.add_argument("--num-frames", type=int, default=64)
     p.add_argument("--val-frames", type=int, default=16)
-    p.add_argument("--image-width", type=int, default=800)
+    p.add_argument("--image-width", type=int, default=1920)
     p.add_argument("--objects-per-frame", type=int, default=18)
     p.add_argument("--point-cloud-range", nargs=6, type=float,
                    default=[-51.2, -51.2, -3.0, 51.2, 51.2, 5.0])

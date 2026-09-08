@@ -182,7 +182,10 @@ model:
         out_channels: 80
         image_size: ${image_size}
         feature_size: ${[image_size[0] // 8, image_size[1] // 8]}
-        xbound: [-32.0, 32.0, 0.32]
+        # Front-only x, matching point_cloud_range. 32 m / 0.16 = 200 cells,
+        # halved by `downsample: 2` to the 100 the LiDAR branch produces; the
+        # lateral axis is unchanged at 64 m / 0.32 = 200 -> 100.
+        xbound: [0.0, 32.0, 0.16]
         ybound: [-32.0, 32.0, 0.32]
         zbound: [-10.0, 10.0, 20.0]
         dbound: [1.0, 50.0, 0.5]

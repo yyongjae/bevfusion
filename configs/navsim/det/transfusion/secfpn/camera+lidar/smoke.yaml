@@ -1,15 +1,30 @@
 # ============================================================
 # BEVFusion | NAVSIM | smoke test (camera+LiDAR)
 # ============================================================
-# Runs the full teacher model over the synthetic dataset produced by
-# tools/make_navsim_smoke_data.py -- real images and calibration, synthetic
-# LiDAR and boxes. Use it to verify the environment and the data plumbing;
-# the numbers it produces are meaningless.
+# Runs the full teacher model over a few dozen frames. Use it to verify the
+# environment and the data plumbing; the numbers it produces are meaningless.
+#
+# Either source of data/navsim_smoke/ works.
+#
+# (a) Synthetic LiDAR and boxes over real images and calibration. Needs the
+#     navsim_map_infos_*.pkl that the plain NAVSIM download does not ship:
 #
 #   python tools/make_navsim_smoke_data.py \
-#       --map-infos /home/data/navsim_resmap/infos/navsim_map_infos_navtest.pkl \
-#       --sensor-root /home/data/sensor_blobs_800x450 --split test \
+#       --map-infos /path/to/navsim_map_infos_navtest.pkl \
+#       --sensor-root /path/to/openscene/trainval_sensor_blobs --split test \
 #       --num-frames 64 --val-frames 16 --out-dir data/navsim_smoke
+#
+# (b) Real frames, straight from the ordinary download. Convert a handful of
+#     logs, then split the result into the two ann_files below:
+#
+#   python tools/data_converter/navsim_converter.py \
+#       --navsim-logs  /path/to/openscene/trainval_navsim_logs/trainval \
+#       --sensor-root  /path/to/openscene/trainval_sensor_blobs \
+#       --split trainval --scene-filter /path/to/scene_filter/navtrain.yaml \
+#       --keyframes-only --check-files --max-logs 8 --max-sweeps 2 \
+#       --lidar-prefix lidar --lidar-ext .pcd \
+#       --out data/navsim_smoke/infos/navsim_infos_smoke_train.pkl
+#
 #   torchpack dist-run -np 1 python tools/train.py \
 #       configs/navsim/det/transfusion/secfpn/camera+lidar/smoke.yaml \
 #       --run-dir runs/navsim-smoke

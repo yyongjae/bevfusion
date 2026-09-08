@@ -6,17 +6,20 @@
 #   - 7 nuPlan object classes
 #   - Ego frame origin is the rear axle, ~0.32 m above the ground, so the
 #     vertical range is [-3, 5] instead of nuScenes' [-5, 3].
-#   - 360-degree BEV, front-only queries. The encoder runs over +-32 m in
-#     both axes -- the extent TransFuser / WoTE / SeerDrive rasterise and the
-#     one PARA-SSR's `pc_range` uses -- and `bev_roi` then restricts query
-#     initialisation to the forward half, the way WoTE encodes +-32 m but
-#     rasterises only x in [0, 32]. Requires the uncropped 360-degree clouds.
-#   - The grid is 100 x 100 at 0.64 m, identical to PARA-SSR's bev_h/bev_w,
-#     so BEV distillation is a crop of this teacher rather than a resample.
+#   - Front-only BEV: x_forward in [0, 32] m, y_left in [-32, 32] m. A
+#     three-front-camera teacher has no rear observation, and encoding the rear
+#     anyway cost ~half the LiDAR compute for supervision the student cannot
+#     use. `bev_roi` is therefore gone -- the grid *is* the queried region.
+#   - The grid is 100 x 100, matching PARA-SSR's `pc_range` / `bev_h` / `bev_w`
+#     one-to-one, so BEV distillation is a straight copy. Cells are 0.32 m
+#     longitudinal x 0.64 m lateral, non-square, exactly as the student's are
+#     (see navsim/agents/para_ssr/configs/default.py). A square-cell 50 x 100
+#     variant is the planned ablation on both sides; it needs voxel_size
+#     [0.08, 0.08, 0.2] and sparse_shape/grid_size [400, 800, 41] here.
 #   - No temporal sweeps (each frame ships one merged point cloud)
 #   - No map segmentation head, no GT-database paste
-#   - Images are stored down-scaled (800x450 from 1920x1080); the resize
-#     limits below are expressed relative to the *stored* size.
+#   - Images are the native 1920x1080 blobs; the resize limits below are
+#     expressed relative to the *stored* size.
 # ============================================================
 
 dataset_type: NavsimDataset
@@ -30,15 +33,32 @@ use_dim: 5
 load_augmented: null
 sweeps_num: 2
 
-point_cloud_range: [-32.0, -32.0, -3.0, 32.0, 32.0, 5.0]
+point_cloud_range: [0.0, -32.0, -3.0, 32.0, 32.0, 5.0]
 
-# Region the detector is actually asked about: the forward half. The encoder
-# still sees all of point_cloud_range -- rear points feed the sparse
-# convolutions and the dense heatmap is supervised everywhere -- but query
-# initialisation, and therefore every cached teacher output, is confined here.
-# [x_min, y_min, x_max, y_max] in metres.
-bev_roi: [0.0, -32.0, 32.0, 32.0]
-voxel_size: [0.08, 0.08, 0.2]   # x8 out_size_factor -> 0.64 m BEV cell
+# No query-initialisation mask: the grid covers only the forward region now, so
+# every cell is a legitimate proposal site. `null` restores the head's default
+# (whole grid). Kept as a knob because the head still supports it.
+bev_roi: null
+
+# The three front cameras span only ~+-87 degrees, so the front rectangle above
+# still contains corners no camera observes. `ObjectFOVFilter` (train targets)
+# and `eval_cfg.camera_fov` (evaluation GT) drop boxes that project into none of
+# the cameras listed in `camera_names`. Both use the same projection test -- see
+# mmdet3d/datasets/fov_utils.py. Set enabled: false to keep every box inside the
+# range filter instead.
+camera_fov:
+  enabled: true
+  min_visible_corners: 1   # 1 keeps boxes clipped by the image border
+  margin: 0.0              # pixels of slack outside the border
+  # `null` = filter everywhere. With the front-only range there is no rear left
+  # to protect, so this is now the whole label set; PointsRangeFilter /
+  # ObjectRangeFilter drop the rear before it matters either way. Give it an
+  # [x_min, y_min, x_max, y_max] box to restrict the filter to part of the grid.
+  apply_within: null
+# Anisotropic on purpose. sparse_shape stays [800, 800, 41] and out_size_factor
+# stays 8, so the head grid is 100 x 100; over a 32 m forward / 64 m lateral ROI
+# that makes cells 0.32 m x 0.64 m -- the student's cells exactly.
+voxel_size: [0.04, 0.08, 0.2]
 image_size: [256, 704]
 
 # Cameras fed to the model. NAVSIM's standard front view is the three front
@@ -48,10 +68,14 @@ camera_names:
   - CAM_L0
   - CAM_R0
 
-# Relative to the stored 800x450 images: 0.88 maps 800 -> 704 (the model
-# width) with no upsampling. Update these if you re-export at another size.
+# Relative to the stored 1920x1080 images: 0.36667 maps 1920 -> 704 (the model
+# width) with no upsampling, and the training range keeps the same ratio to the
+# eval scale that the 800px re-export used ([0.76, 1.0] against 0.88). Both
+# express the identical output sizes -- 608 px at the low end, 800 px at the
+# high end -- so only the source detail differs.
+# Update these if you re-export at another size: eval becomes 704 / new_width.
 augment2d:
-  resize: [[0.76, 1.0], [0.88, 0.88]]
+  resize: [[0.31667, 0.41667], [0.36667, 0.36667]]
   rotate: [-5.4, 5.4]
   gridmask:
     prob: 0.0
@@ -78,10 +102,17 @@ object_classes:
   - generic_object
 
 eval_cfg:
-  # Score the queried region only -- rear GT must not count as missed for a
-  # model that was never asked to look there. Mirrors `bev_roi` above; the
-  # per-class distance limits below apply in addition.
+  # Identical to point_cloud_range above: rear GT must not count as missed for a
+  # model that was never asked to look there. The per-class distance limits
+  # below apply in addition.
   point_cloud_range: [0.0, -32.0, -3.0, 32.0, 32.0, 5.0]
+  # Same projection test the training targets use, so the model is not scored
+  # on objects its cameras never saw. image_wh defaults to the principal point.
+  camera_fov:
+    enabled: ${camera_fov.enabled}
+    min_visible_corners: ${camera_fov.min_visible_corners}
+    margin: ${camera_fov.margin}
+    image_wh: [1920, 1080]
   dist_ths: [0.5, 1.0, 2.0, 4.0]
   dist_th_tp: 2.0
   min_recall: 0.1
@@ -157,6 +188,15 @@ train_pipeline:
     with_bbox_3d: true
     with_label_3d: true
     with_attr_label: False
+  -
+    # Before ImageAug3D/GlobalRotScaleTrans: visibility is a property of the
+    # raw sensor geometry, and keeping it there makes the label set the same
+    # in every epoch.
+    type: ObjectFOVFilter
+    min_visible_corners: ${camera_fov.min_visible_corners}
+    margin: ${camera_fov.margin}
+    enabled: ${camera_fov.enabled}
+    apply_within: ${camera_fov.apply_within}
   -
     type: ImageAug3D
     final_dim: ${image_size}

@@ -19,11 +19,18 @@ def make_cuda_ext(
             "-D__CUDA_NO_HALF_OPERATORS__",
             "-D__CUDA_NO_HALF_CONVERSIONS__",
             "-D__CUDA_NO_HALF2_OPERATORS__",
-            "-gencode=arch=compute_70,code=sm_70",
-            "-gencode=arch=compute_75,code=sm_75",
-            "-gencode=arch=compute_80,code=sm_80",
-            "-gencode=arch=compute_86,code=sm_86",
         ]
+        # torch's cpp_extension only injects -gencode flags from
+        # TORCH_CUDA_ARCH_LIST when none are given here, so the hardcoded list
+        # below would pin the build to sm_70..86 and silently exclude newer
+        # cards (sm_90, sm_120). Keep it only as the default.
+        if not os.getenv("TORCH_CUDA_ARCH_LIST"):
+            extra_compile_args["nvcc"] += [
+                "-gencode=arch=compute_70,code=sm_70",
+                "-gencode=arch=compute_75,code=sm_75",
+                "-gencode=arch=compute_80,code=sm_80",
+                "-gencode=arch=compute_86,code=sm_86",
+            ]
         sources += sources_cuda
     elif (torch.cuda.is_available() and torch.version.hip is not None) or os.getenv("FORCE_ROCM", "0") == 1:
         define_macros += [("WITH_ROCM", None)]

@@ -34,6 +34,7 @@ from pyquaternion import Quaternion
 from mmdet.datasets import DATASETS
 
 from ..core.bbox import LiDARInstance3DBoxes
+from .fov_utils import boxes_in_view, build_lidar2image, image_size_from_intrinsics
 from .custom_3d import Custom3DDataset
 from .nuscenes_styled_eval_utils import (
     DetectionBox,
@@ -395,6 +396,37 @@ class NavsimDataset(Custom3DDataset):
             )
         return result_files, tmp_dir
 
+    def _camera_fov_mask(self, info, gt_boxes):
+        """``(N,)`` mask of GT boxes seen by at least one configured camera.
+
+        ``load_gt`` builds the evaluation GT straight from ``data_infos``,
+        bypassing the pipeline, so ``ObjectFOVFilter`` never touches it.  Without
+        this the model would be scored on objects outside the camera rig's view
+        that the training targets no longer contain.  Controlled by
+        ``eval_cfg['camera_fov']``; absent or ``enabled: false`` keeps every box.
+        """
+        cfg = self.eval_cfg.get("camera_fov")
+        if not cfg or not cfg.get("enabled", False) or len(gt_boxes) == 0:
+            return np.ones(len(gt_boxes), dtype=bool)
+
+        cams = info.get("cams")
+        if not cams or any(name not in cams for name in self.camera_names):
+            return np.ones(len(gt_boxes), dtype=bool)
+
+        image_wh = cfg.get("image_wh") or image_size_from_intrinsics(
+            cams, self.camera_names
+        )
+        corners = LiDARInstance3DBoxes(
+            gt_boxes, box_dim=gt_boxes.shape[-1], origin=(0.5, 0.5, 0.5)
+        ).corners.numpy()
+        return boxes_in_view(
+            corners,
+            build_lidar2image(cams, self.camera_names),
+            tuple(image_wh),
+            min_corners=cfg.get("min_visible_corners", 1),
+            margin=cfg.get("margin", 0.0),
+        )
+
     def load_gt(self):
         """Build the GT :class:`EvalBoxes` from ``data_infos``."""
         all_annotations = EvalBoxes()
@@ -409,8 +441,12 @@ class NavsimDataset(Custom3DDataset):
                 info.get("num_lidar_pts", np.full(len(gt_boxes), -1))
             ).reshape(-1)
 
+            fov_mask = self._camera_fov_mask(info, gt_boxes)
+
             for j in range(len(gt_boxes)):
                 class_name = gt_names[j]
+                if not fov_mask[j]:
+                    continue
                 if not self._in_eval_range(
                     gt_boxes[j, 0], gt_boxes[j, 1], class_name
                 ):

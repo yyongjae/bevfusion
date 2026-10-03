@@ -23,7 +23,9 @@ input_modality:
 
 augment3d:
   scale: [0.95, 1.05]
-  rotate: [-0.3925, 0.3925]
+  # Keep the augmented camera footprint inside the fixed front-only BEV, as in
+  # the camera+LiDAR recipe.
+  rotate: [-0.17453293, 0.17453293]
   translate: 0
 
 train_pipeline:
@@ -35,6 +37,13 @@ train_pipeline:
     with_bbox_3d: true
     with_label_3d: true
     with_attr_label: False
+  -
+    type: ObjectFOVFilter
+    min_visible_corners: ${camera_fov.min_visible_corners}
+    margin: ${camera_fov.margin}
+    enabled: ${camera_fov.enabled}
+    apply_within: ${camera_fov.apply_within}
+    image_wh: ${camera_fov.image_wh}
   -
     type: ImageAug3D
     final_dim: ${image_size}
@@ -51,6 +60,8 @@ train_pipeline:
     is_train: true
   -
     type: RandomFlip3D
+    # x -> -x would move the camera footprint behind the front-only BEV.
+    vertical: false
   -
     type: ObjectRangeFilter
     point_cloud_range: ${point_cloud_range}
@@ -182,10 +193,10 @@ model:
         out_channels: 80
         image_size: ${image_size}
         feature_size: ${[image_size[0] // 8, image_size[1] // 8]}
-        # Front-only x, matching point_cloud_range. 32 m / 0.16 = 200 cells,
-        # halved by `downsample: 2` to the 100 the LiDAR branch produces; the
+        # Front-only x, matching point_cloud_range. 32 m / 0.32 = 100 cells,
+        # halved by `downsample: 2` to the 50 the LiDAR branch produces; the
         # lateral axis is unchanged at 64 m / 0.32 = 200 -> 100.
-        xbound: [0.0, 32.0, 0.16]
+        xbound: [0.0, 32.0, 0.32]
         ybound: [-32.0, 32.0, 0.32]
         zbound: [-10.0, 10.0, 20.0]
         dbound: [1.0, 50.0, 0.5]
@@ -236,7 +247,7 @@ model:
       train_cfg:
         dataset: NAVSIM
         point_cloud_range: ${point_cloud_range}
-        grid_size: [800, 800, 41]
+        grid_size: [400, 800, 41]
         voxel_size: ${voxel_size}
         out_size_factor: 8
         gaussian_overlap: 0.1
@@ -262,7 +273,7 @@ model:
       test_cfg:
         dataset: NAVSIM
         bev_roi: ${bev_roi}
-        grid_size: [800, 800, 41]
+        grid_size: [400, 800, 41]
         out_size_factor: 8
         voxel_size: ${voxel_size[:2]}
         pc_range: ${point_cloud_range[:2]}

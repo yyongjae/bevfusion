@@ -10,9 +10,9 @@ Visibility is decided by **projection**, mirroring BEVFormer's
 ``point_sampling``: push the point through the full ``lidar -> image`` matrix,
 require positive depth, and require the pixel to land inside the image.  A
 fixed azimuth threshold is not equivalent -- the cameras sit off the LiDAR
-origin, so the observed region is not a clean wedge from the ego frame.  On
-navtrain, projection drops 4.4% of the boxes inside the front-only ROI where an
-equivalent +-87 degree wedge drops only 1.6%.
+origin, so the observed region is not a clean wedge from the ego frame. On a
+fixed 150-frame navtrain sample, projection drops 5.2% of the boxes inside the
+front-only ROI where an equivalent +-87 degree wedge drops only 1.6%.
 
 The test is deliberately run on the **raw sensor geometry**, before
 ``ImageAug3D`` / ``GlobalRotScaleTrans``.  Those augmentations rotate the LiDAR
@@ -59,9 +59,11 @@ def image_size_from_intrinsics(
 ) -> Tuple[float, float]:
     """Infer ``(width, height)`` from the principal point.
 
-    NAVSIM's intrinsics are centred, so ``2 * c`` recovers the stored size
-    without the images having to be opened.  Used only when the caller has no
-    explicit size to hand.
+    Last resort only.  It assumes a centred principal point, which NAVSIM does
+    not have vertically: ``cy`` is 560 on 1080-row images, so the height comes
+    out 40 px too large and the test turns slightly permissive.  Prefer an
+    explicit size (``camera_fov.image_wh``, or ``ori_shape`` when the pipeline
+    has loaded an image).
     """
     for name in camera_names:
         K = np.asarray(cams[name]["cam_intrinsic"], dtype=np.float64)

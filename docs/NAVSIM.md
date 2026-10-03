@@ -178,9 +178,9 @@ official split that is 112,183 of 227,617 files, ~86 GB).
 
 ```
 point_cloud_range: [0.0, -32.0, -3.0, 32.0, 32.0, 5.0]
-voxel_size:        [0.04, 0.08, 0.2]      -> 800 x 800 x 40 voxels
-                                          -> 100 x 100 head grid
-                                          -> 0.32 m longitudinal, 0.64 m lateral
+voxel_size:        [0.08, 0.08, 0.2]      -> 400 x 800 x 40 voxels
+                                          -> 50 x 100 head grid
+                                          -> 0.64 m square cells
 bev_roi:           null
 ```
 
@@ -188,18 +188,21 @@ bev_roi:           null
   has no rear observation, so encoding `x in [-32, 0]` bought supervision the
   student cannot use and cost roughly half the LiDAR compute: points per sample
   drop 225k -> 114k and a fp32 iteration (B=4, one RTX 5090) drops 695 -> 448 ms.
-* **The grid matches PARA-SSR one-for-one.** The student's `pc_range` is
-  `(-32, 0, -2, 32, 32, 2)` with `bev_h = bev_w = 100`, i.e. the same 32 m
-  forward / 64 m lateral box at the same 0.32 x 0.64 m cells, so distillation is
-  a straight copy -- no crop, no resample. The axes still differ in convention:
-  mmdet3d LiDAR is x-forward / y-left, the student is y-forward / x-right.
-* **The cells are deliberately non-square.** `sparse_shape` stays
-  `[800, 800, 41]` and `out_size_factor` stays 8, so halving `voxel_size[0]` to
-  0.04 is what turns 32 m of forward extent into 100 cells. This mirrors the
-  student's own "keep 100 x 100 for the first controlled experiment" choice. The
-  square-cell variant both sides plan to ablate is `voxel_size
-  [0.08, 0.08, 0.2]` with `sparse_shape`/`grid_size` `[400, 800, 41]` -> 50 x 100
-  at 0.64 m.
+* **The cells are square.** `voxel_size` is isotropic at 0.08 m and
+  `sparse_shape` / `grid_size` are `[400, 800, 41]`, so with `out_size_factor` 8
+  the head grid is 50 x 100 at 0.64 m in both axes. This is the square-cell
+  variant the student's config comment anticipates ("see the report for the
+  square-cell 50 x 100 ablation that should follow").
+* **It no longer matches PARA-SSR cell for cell.** The student's `pc_range` is
+  `(-32, 0, -2, 32, 32, 2)` with `bev_h = bev_w = 100`, i.e. the same physical
+  box but 0.32 m longitudinal cells. The lateral axes still agree at 0.64 m; the
+  longitudinal one does not, so distillation needs a 50 -> 100 resample along it
+  unless the student is moved to 50 x 100 as well. The axes also differ in
+  convention: mmdet3d LiDAR is x-forward / y-left, the student is y-forward /
+  x-right.
+* **Reverting** to the 100 x 100 teacher means `voxel_size [0.04, 0.08, 0.2]`,
+  `sparse_shape` / `grid_size` `[800, 800, 41]`, and the camera `xbound` step
+  back to 0.16.
 * **`bev_roi` is no longer needed.** It existed to keep query initialisation in
   the forward half of a 360-degree grid; the grid is now that half. The head
   still supports it, so an ROI inside the front region can be set if wanted.
@@ -215,42 +218,52 @@ bev_roi:           null
 
 ### Camera field of view
 
-The ROI is a rectangle, but the three front cameras are not.  Measured from
-the NAVSIM calibration, each has a 63.7 degree horizontal FOV and they sit at
-yaw 0.2 / +55.2 / -55.5 degrees, so together they span **-87.3 to +87.0
-degrees** -- overlapping, with no gap, but 3 degrees short of the 180 degree
-half-plane at each side.
+The GT predicate follows SafeDrive's, which is the reference this teacher is
+compared against: `boxes_in_bev_roi` keeps a box when its **centre** lies in the
+rectangle `0 <= x <= 32`, `-32 <= y <= 32`, with no visibility test at all.
+`point_cloud_range` plus `ObjectRangeFilter` already reproduce that exactly --
+`in_range_bev` tests the same centre -- so nothing further is applied by
+default, and the pipeline's GT count matches SafeDrive's predicate box for box.
 
-Objects are therefore filtered by **projection**, not by an azimuth threshold:
-a box is kept when at least one of its eight corners projects into one of the
-cameras listed in `camera_names`, with positive depth and a pixel inside the
-image.  This is BEVFormer's `point_sampling` test.  It is not the same as a
-wedge, because the cameras sit off the LiDAR origin -- inside the front-only
-ROI, projection drops 4.4% of boxes where an equivalent +-87 degree wedge drops
-1.6%.
+SafeDrive's projection test (`point_sampling`) masks BEV *features*, deciding
+which BEV queries attend to which camera; it never touches labels. BEVFusion's
+LSS already restricts camera features to what the cameras see, so the analogue
+is in place.
 
-Two places apply it, both driven by `camera_fov` in
-`configs/navsim/default.yaml`:
+An optional label-level filter is available for experiments. `camera_fov`
+(default `enabled: false`) projects the eight box corners through `lidar2image`
+and keeps a box when at least one corner lands in an image with positive depth
+-- see `mmdet3d/datasets/fov_utils.py`.  Measured on 400 navtrain frames, the
+three front cameras (CAM_F0 63.7 degrees at yaw 0.2, CAM_L0 at +55.2, CAM_R0 at
+-55.5) span -87.3 to +87.0 degrees, and the filter removes 5.2% of the in-ROI
+boxes:
 
-* `ObjectFOVFilter` in the training pipeline, placed before `ImageAug3D` so the
-  test runs on the raw sensor geometry.  The augmentations rotate the LiDAR
-  frame only virtually -- the model undoes them through `lidar_aug_matrix` when
-  it projects -- so visibility follows an object's original position, and
-  keeping the test pre-augmentation makes the label set identical every epoch.
-* `eval_cfg.camera_fov`, because `NavsimDataset.load_gt` builds the evaluation
-  GT straight from the info files and never runs the pipeline.  Without it the
-  model would be scored on objects the training targets no longer contain.
+| distance | boxes | removed |
+| --- | --- | --- |
+| 2-5 m | 153 | 28.8% |
+| 5-10 m | 762 | 16.1% |
+| 10-20 m | 2486 | 4.1% |
+| 20-32 m | 3255 | 2.8% |
 
-`camera_fov.apply_within` decides the scope, and the choice matters:
+The near field dominates because the forward-facing cameras cannot look down far
+enough, and the LiDAR sees those objects perfectly -- which is why this is off
+for a camera+LiDAR teacher.
 
-`apply_within` (default `null`) restricts the filter to an
-`[x_min, y_min, x_max, y_max]` box, leaving boxes outside it untouched.  With a
-front-only `point_cloud_range` there is nothing left to protect -- the range
-filters drop the rear regardless -- so `null` is the right default now.  It
-mattered when the grid was 360 degrees: `null` removed 45.6% of the targets
-there (every rear box), against 3.3% for `apply_within: ${bev_roi}`.
+Note that enabling it does **not** reproduce PARA-SSR's label set either. The
+student applies `det_fov_half_angle_deg: 80`, a centre-based angular wedge; the
+two predicates agree on 93.1% of in-ROI boxes and disagree on 2.9% (0.7% the
+student keeps and this drops, 2.3% the reverse). Matching the student exactly
+would need a wedge mode, not this projection.
 
-`camera_fov.enabled: false` restores the unfiltered behaviour.
+Both places that consume it are driven by the same `camera_fov` block:
+`ObjectFOVFilter` in the training pipelines (placed before `ImageAug3D`, so the
+test runs on raw sensor geometry and the label set is identical every epoch),
+and `eval_cfg.camera_fov`, which masks evaluation GT *and* predictions --
+`NavsimDataset.load_gt` and `_format_bbox` never run the pipeline. Masking only
+the GT would leave detections outside the region counting as false positives
+with no GT to match. `camera_fov.image_wh` must be the stored image size:
+NAVSIM's principal point is not centred vertically (cy = 560 on 1080 rows), so
+inferring it from intrinsics overestimates the height by 40 px.
 
 **A front-only ROI is not the same thing as front-cropped clouds, and this
 configuration still requires the uncropped 360-degree ones.**  `PointsRangeFilter`

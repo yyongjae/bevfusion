@@ -4,7 +4,14 @@ from mmdet.core.bbox.match_costs import build_match_cost
 from mmdet.core.bbox.match_costs.builder import MATCH_COST
 from mmdet.core.bbox.iou_calculators import build_iou_calculator
 import torch
-import warnings
+
+from mmdet3d.utils import get_root_logger
+
+# Number of samples whose cost matrix was non-finite.  Counted rather than
+# warned about: `warnings.warn` is deduplicated per call site, so a run that
+# diverges would leave a single line in a log of thousands, and the fallback
+# below hides the divergence by turning the sample into pure background.
+_NONFINITE_COST_COUNT = 0
 
 try:
     from scipy.optimize import linear_sum_assignment
@@ -122,14 +129,23 @@ class HungarianAssigner3D(BaseAssigner):
 
         # 3. do Hungarian matching on CPU using linear_sum_assignment
         cost = cost.detach().cpu()
-        # Skip sample if cost matrix contains NaN/Inf (corrupted predictions)
-        if torch.isnan(cost).any() or torch.isinf(cost).any():
-            warnings.warn(
-                f'NaN/Inf detected in cost matrix '
-                f'(shape={cost.shape}, '
-                f'nan={torch.isnan(cost).sum().item()}, '
-                f'inf={torch.isinf(cost).sum().item()}). '
-                f'Skipping this sample, assigning all to background.')
+        # Skip sample if cost matrix contains NaN/Inf (corrupted predictions).
+        # Assigning everything to background keeps the step alive, so the event
+        # has to be loud: it is logged on first occurrence and then on a
+        # widening schedule, always with the running total.
+        if not torch.isfinite(cost).all():
+            global _NONFINITE_COST_COUNT
+            _NONFINITE_COST_COUNT += 1
+            n = _NONFINITE_COST_COUNT
+            if n <= 10 or n % 100 == 0:
+                get_root_logger().warning(
+                    'non-finite Hungarian cost matrix '
+                    f'(shape={tuple(cost.shape)}, '
+                    f'nan={torch.isnan(cost).sum().item()}, '
+                    f'inf={torch.isinf(cost).sum().item()}); '
+                    'sample assigned entirely to background. '
+                    f'occurrences so far: {n}'
+                )
             assigned_gt_inds[:] = 0
             return AssignResult(
                 num_gts, assigned_gt_inds, torch.zeros_like(iou.max(1).values),

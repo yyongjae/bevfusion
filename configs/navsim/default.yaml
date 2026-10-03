@@ -40,14 +40,25 @@ point_cloud_range: [0.0, -32.0, -3.0, 32.0, 32.0, 5.0]
 # (whole grid). Kept as a knob because the head still supports it.
 bev_roi: null
 
-# The three front cameras span only ~+-87 degrees, so the front rectangle above
-# still contains corners no camera observes. `ObjectFOVFilter` (train targets)
-# and `eval_cfg.camera_fov` (evaluation GT) drop boxes that project into none of
-# the cameras listed in `camera_names`. Both use the same projection test -- see
-# mmdet3d/datasets/fov_utils.py. Set enabled: false to keep every box inside the
-# range filter instead.
+# Camera field-of-view filtering, OFF by default to match the reference
+# implementations this teacher is compared against.
+#
+# SafeDrive keeps a GT box on the box-centre rectangle alone
+# (`boxes_in_bev_roi`: 0 <= x <= 32, -32 <= y <= 32, no visibility test), which
+# is exactly what `point_cloud_range` + `ObjectRangeFilter` already do here --
+# `in_range_bev` tests the same centre. Its projection test (`point_sampling`)
+# masks BEV *features*, not labels, and BEVFusion's LSS already restricts camera
+# features to what the cameras see.
+#
+# Turning this on filters labels by projecting the eight box corners through
+# `lidar2image` (see mmdet3d/datasets/fov_utils.py), which removes 5.2% of the
+# in-ROI boxes -- concentrated in the near field, 18% within 10 m, where the
+# forward-facing cameras cannot look down far enough. PARA-SSR applies a related
+# but different rule (`det_fov_half_angle_deg: 80`, a centre-based wedge), so
+# enabling this does not reproduce the student's label set either: the two
+# predicates agree on 93.1% of in-ROI boxes and disagree on 2.9%.
 camera_fov:
-  enabled: true
+  enabled: false
   min_visible_corners: 1   # 1 keeps boxes clipped by the image border
   margin: 0.0              # pixels of slack outside the border
   # `null` = filter everywhere. With the front-only range there is no rear left
@@ -55,10 +66,19 @@ camera_fov:
   # ObjectRangeFilter drop the rear before it matters either way. Give it an
   # [x_min, y_min, x_max, y_max] box to restrict the filter to part of the grid.
   apply_within: null
-# Anisotropic on purpose. sparse_shape stays [800, 800, 41] and out_size_factor
-# stays 8, so the head grid is 100 x 100; over a 32 m forward / 64 m lateral ROI
-# that makes cells 0.32 m x 0.64 m -- the student's cells exactly.
-voxel_size: [0.04, 0.08, 0.2]
+  # Stored image size. Needed by the LiDAR-only stage, whose pipeline loads no
+  # image; do not leave it to the principal point, which NAVSIM does not centre
+  # vertically (cy = 560 on 1080 rows). Update this with any image re-export so
+  # stage 1 and the image-loading stages keep identical targets.
+  image_wh: [1920, 1080]
+# Isotropic: 0.08 m voxels with sparse_shape [400, 800, 41] and out_size_factor
+# 8 give a 50 x 100 head grid over the 32 m forward / 64 m lateral ROI, i.e.
+# square 0.64 m cells. The earlier 100 x 100 variant used [0.04, 0.08, 0.2] to
+# match PARA-SSR's own 100 x 100, whose cells are 0.32 m longitudinal x 0.64 m
+# lateral; that grid is the one the student still runs, so distillation across
+# this change needs the longitudinal axis resampled 50 -> 100 (or the student
+# moved to 50 x 100 as its config comment anticipates).
+voxel_size: [0.08, 0.08, 0.2]
 image_size: [256, 704]
 
 # Cameras fed to the model. NAVSIM's standard front view is the three front
@@ -81,14 +101,23 @@ augment2d:
     prob: 0.0
     fixed_prob: true
 
-# With 360-degree clouds the upstream nuScenes augmentation is valid again:
-# the point cloud is rotationally symmetric, so yaw and both mirrors map
-# sensed region onto sensed region. (On the front-cropped clouds this was not
-# true -- the x-flip alone dropped 59% of the points and left 43% of camera
-# views with no LiDAR depth; see git history.)
+# The files contain 360-degree clouds, but the queried BEV and camera-conditioned
+# labels cover only the forward half. The augmentation must therefore keep the
+# camera footprint substantially inside that fixed half-plane. In particular,
+# x -> -x mirroring is disabled in the pipelines below.
 augment3d:
   scale: [0.9, 1.1]
-  rotate: [-0.78539816, 0.78539816]
+  # +-10 degrees, not the +-45 upstream uses with 360-degree cameras. The ROI
+  # spans 180 degrees of azimuth and the three front cameras cover 174. As a
+  # far-field angular estimate, yaw theta leaves (|theta| + 3) / 180 of the ROI
+  # unobserved: 27% at 45 degrees and 7% here. Camera translation and the finite
+  # rectangular ROI make this an approximation, not a geometric optimum. The
+  # unobserved part has no camera features at all -- a distribution the model
+  # never meets at test time, where no rotation is applied -- and its labels are
+  # deleted by ObjectFOVFilter. Paired-seed 150-frame checks retained
+  # 88-91% of targets at 45 degrees against 94-96% here. Raise it only if the
+  # camera set is widened.
+  rotate: [-0.17453293, 0.17453293]
   translate: 0.5
 
 # nuPlan TrackedObjectType names, as they appear in anns['gt_names'].
@@ -107,12 +136,14 @@ eval_cfg:
   # below apply in addition.
   point_cloud_range: [0.0, -32.0, -3.0, 32.0, 32.0, 5.0]
   # Same projection test the training targets use, so the model is not scored
-  # on objects its cameras never saw. image_wh defaults to the principal point.
+  # on objects its cameras never saw. Keep image_wh explicit: NAVSIM's vertical
+  # principal point is not centred in the stored image.
   camera_fov:
     enabled: ${camera_fov.enabled}
     min_visible_corners: ${camera_fov.min_visible_corners}
     margin: ${camera_fov.margin}
-    image_wh: [1920, 1080]
+    apply_within: ${camera_fov.apply_within}
+    image_wh: ${camera_fov.image_wh}
   dist_ths: [0.5, 1.0, 2.0, 4.0]
   dist_th_tp: 2.0
   min_recall: 0.1
@@ -197,6 +228,7 @@ train_pipeline:
     margin: ${camera_fov.margin}
     enabled: ${camera_fov.enabled}
     apply_within: ${camera_fov.apply_within}
+    image_wh: ${camera_fov.image_wh}
   -
     type: ImageAug3D
     final_dim: ${image_size}
@@ -213,6 +245,11 @@ train_pipeline:
     is_train: true
   -
     type: RandomFlip3D
+    # An x -> -x mirror moves the camera footprint behind the fixed front-only
+    # BEV and moves rear objects, whose labels ObjectFOVFilter already removed,
+    # into it. Lateral mirroring remains valid because both the rig and ROI are
+    # left/right symmetric.
+    vertical: false
   -
     type: PointsRangeFilter
     point_cloud_range: ${point_cloud_range}

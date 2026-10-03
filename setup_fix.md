@@ -415,16 +415,20 @@ smoke의 mAP 0.0은 정상이다 — 64프레임 x 1 epoch x random init이며, 
 | 항목 | before | after |
 |---|---|---|
 | `point_cloud_range` | `[-32,-32,-3, 32,32,5]` | `[0,-32,-3, 32,32,5]` |
-| `voxel_size` | `[0.08, 0.08, 0.2]` | `[0.04, 0.08, 0.2]` |
+| `voxel_size` | `[0.08, 0.08, 0.2]` | `[0.08, 0.08, 0.2]` (등방 유지) |
 | `bev_roi` | `[0,-32,32,32]` | `null` |
 | `camera_fov.apply_within` | `${bev_roi}` | `null` |
 | `xbound` (LSS) | `[-32, 32, 0.32]` | `[0, 32, 0.16]` |
 | `sparse_shape` / `grid_size` / `out_size_factor` | `[800,800,41]` / 8 | 그대로 |
 
-`sparse_shape` 를 유지한 채 `voxel_size` 의 x만 절반으로 줄이는 것이 요점이다.
-800/8 = 100이 유지되면서 전방 32 m가 100칸이 되어 셀이 **0.32 m(종) x 0.64 m(횡)** 이 된다.
-이는 PARA-SSR student(`pc_range=(-32,0,-2,32,32,2)`, `bev_h=bev_w=100`)와 **정확히 동일**해서
-distillation이 crop도 resample도 아닌 단순 복사가 된다.
+`point_cloud_range` 에서 후방을 빼고 `sparse_shape`/`grid_size` 를 `[400, 800, 41]` 로 줄이면
+out_size_factor 8에서 **50 x 100 격자, 0.64 m 정사각 셀**이 된다.
+
+> 이력: 한때 `voxel_size [0.04, 0.08, 0.2]` + `sparse_shape [800,800,41]` 로 100 x 100
+> (0.32 m 종 x 0.64 m 횡)을 썼다. PARA-SSR student(`bev_h=bev_w=100`)와 셀 단위로 일치시켜
+> distillation을 단순 복사로 만들려던 것이다. 이후 정사각 셀로 전환하면서 종축이 student의
+> 절반 해상도가 되었으므로, distillation 시 종축 50 -> 100 resample이 필요하거나
+> student를 50 x 100 으로 옮겨야 한다.
 
 ### 왜 이전 구조는 시간이 안 줄었나
 
@@ -459,43 +463,66 @@ distillation이 crop도 resample도 아닌 단순 복사가 된다.
 
 ---
 
-## 전방 카메라 FOV 필터 (추가 기능)
+## 전방 카메라 FOV 필터 (기본 OFF)
 
-ROI는 사각형이지만 전방 카메라 3개는 그렇지 않다. NAVSIM 캘리브레이션 실측:
+GT 판정은 **SafeDrive와 동일**하게 맞췄다. SafeDrive의 `boxes_in_bev_roi` 는
+박스 **중심**이 사각형 `0 <= x <= 32`, `-32 <= y <= 32` 안이면 유지하고 가시성 검사는 하지 않는다.
+`point_cloud_range` + `ObjectRangeFilter` 가 이미 그것과 동일하다 (`in_range_bev` 도 중심 기준).
+실제로 파이프라인 GT 수가 SafeDrive predicate와 정확히 일치함을 확인했다 (150 프레임, 3067 = 3067).
 
-| 카메라 | hfov | yaw | 방위각 범위 |
-|---|---|---|---|
-| CAM_F0 | 63.71° | 0.16° | −31.69° ~ 32.02° |
-| CAM_L0 | 63.71° | 55.17° | 23.32° ~ 87.03° |
-| CAM_R0 | 63.71° | −55.46° | −87.31° ~ −23.60° |
+SafeDrive의 투영 테스트(`point_sampling`)는 BEV **feature** 마스킹용이지 라벨을 건드리지 않는다.
+BEVFusion은 LSS가 이미 카메라가 보는 곳에만 feature를 올리므로 대응물이 이미 있다.
 
-합집합 **−87.31° ~ +87.03°** — 서로 겹쳐 빈틈은 없고, 전방 절반(±90°)보다 양쪽 3°씩 좁다.
-(±80° 가정보다는 넓다.)
+실험용으로 라벨 단위 필터를 남겨뒀다 (`camera_fov`, 기본 `enabled: false`).
+박스 8개 코너를 `lidar2image` 로 투영해 하나라도 이미지 안에 양의 깊이로 찍히면 유지한다
+(`mmdet3d/datasets/fov_utils.py`).
 
-각도 임계값 대신 **투영**으로 판정한다 (SafeDrive/BEVFormer의 `point_sampling` 방식):
-박스 8개 코너 중 하나 이상이 `camera_names` 의 어느 카메라에든 양의 깊이로, 이미지 안에 찍히면 유지.
-카메라가 LiDAR 원점에서 떨어져 장착돼 있어 실제 관측 영역이 원점 기준 부채꼴이 아니기 때문에
-둘은 같지 않다 — front-only ROI 안에서 투영은 4.4%를 걸러내는데 동일 FOV의 각도 wedge는 1.6%뿐이다.
+카메라 3대 실측 방위각 (CAM_F0 63.7°@yaw 0.2, L0 @+55.2, R0 @-55.5) 합집합은 **-87.3 ~ +87.0°**.
+켰을 때 ROI 내 박스의 5.2%가 제거되는데, **근거리에 집중**된다 (navtrain 400 프레임):
 
-적용 지점 2곳 (`configs/navsim/default.yaml` 의 `camera_fov` 로 제어):
+| 거리 | 박스 수 | 제거율 |
+|---|---|---|
+| 2-5 m | 153 | 28.8% |
+| 5-10 m | 762 | 16.1% |
+| 10-20 m | 2486 | 4.1% |
+| 20-32 m | 3255 | 2.8% |
 
-- `ObjectFOVFilter` — 학습 파이프라인, `ImageAug3D` **앞**에 배치. 증강은 LiDAR 프레임을 가상으로
-  회전시킬 뿐이고 모델이 `lidar_aug_matrix` 로 되돌려 투영하므로, 가시성은 원래 위치의 성질이다.
-  증강 전에 두면 매 epoch 라벨이 동일해지는 이점도 있다.
-- `eval_cfg.camera_fov` — `NavsimDataset.load_gt` 가 파이프라인을 타지 않고 info에서 직접 GT를
-  만들기 때문에 별도로 필요하다. 없으면 학습 타깃에 없는 객체로 채점된다.
+전방 카메라가 발밑을 못 보기 때문이고, LiDAR는 그 객체들을 완벽히 본다. camera+LiDAR teacher에서
+이걸 끄는 이유다.
 
-`camera_fov.apply_within` 은 `[x_min, y_min, x_max, y_max]` 박스로 필터 적용 범위를
-제한한다. **기본값은 `null`(전 영역)** 이다 — `point_cloud_range` 가 전방 전용이 된 뒤로는
-range filter가 후방을 어차피 버리므로 보호할 대상이 없다.
+**켠다고 student와 같아지지도 않는다.** PARA-SSR은 `det_fov_half_angle_deg: 80` 의
+중심 기준 각도 wedge를 쓴다. 두 predicate는 ROI 내 박스의 93.1%에서 일치하고 2.9%에서 갈린다
+(student만 유지 0.7%, teacher만 유지 2.3%). student와 정확히 맞추려면 투영이 아니라 wedge 모드가 필요하다.
 
-이 값은 격자가 360°이던 시절에 의미가 있었다. 그때는 `null` 이 후방 GT를 포함해 타깃의
-45.6%를 제거했고, `${bev_roi}` 는 3.3%만 제거했다 (navtrain 200 프레임 표본).
+`camera_fov` 는 두 곳이 함께 참조한다: 학습 파이프라인의 `ObjectFOVFilter`(증강 전 배치),
+그리고 `eval_cfg.camera_fov`(평가 GT와 **예측** 양쪽). `load_gt` 와 `_format_bbox` 는 파이프라인을
+타지 않으므로 별도 적용이 필요하고, GT만 거르면 FOV 밖 예측이 근거 없는 FP가 된다.
+`camera_fov.image_wh` 는 반드시 실제 저장 해상도로 둘 것 — NAVSIM 주점이 수직으로 중심이 아니라
+(`cy=560`, 실제 1080) intrinsics로 유도하면 높이가 40px 과대평가된다.
 
-`camera_fov.enabled: false` 면 필터가 꺼진다.
+---
 
-관련 파일: `mmdet3d/datasets/fov_utils.py`(신규), `pipelines/transforms_3d.py`(`ObjectFOVFilter`),
-`navsim_dataset.py`(`load_gt`).
+## 증강: 전방 전용 ROI에서 반드시 꺼야 하는 것
+
+`RandomFlip3D` 의 `vertical` 은 이미지 상하 반전이 아니라 **좌표계 x -> -x, 즉 전후 반전**이다.
+클래스 docstring이 "Disable this whenever the point cloud only covers one half of the BEV"
+라고 명시하는데, config가 인자 없이 써서 기본 True로 켜져 있었다.
+
+전방 전용 ROI에서 이게 켜져 있으면 원래 후방이던 장면이 전방 ROI로 들어온다. FOV 필터까지 켠 상태로
+측정하면 타깃 유지율이 **41%** 까지 떨어지고 GT가 완전히 빈 프레임이 급증했다 (150 중 50~83개).
+빈 프레임은 mmdet3d의 `prepare_train_data` 가 `_rand_another` 로 **무작위 다른 프레임으로 대체**하므로
+조용히 학습 분포가 망가진다.
+
+`vertical: false` 적용 후 유지율은 94.8%로 회복되고 빈 프레임도 baseline과 같아진다.
+
+회전은 `[-0.7854, 0.7854]`(±45°)에서 `[-0.1745, 0.1745]`(**±10°**)로 줄였다. ROI는 방위각 180° 폭이고
+카메라 커버리지는 174°라, θ 회전 시 ROI의 `(|θ|+3)/180` 이 카메라 사각지대가 된다 (±45°면 27%).
+그 영역은 카메라 feature 자체가 비어서 테스트 때 없는 분포를 학습하게 된다.
+다만 flip을 고친 뒤 측정하면 ±45°에서도 유지율 88~89%로 ±10°(94.4%)와 차이가 5pp 남짓이므로,
+**±10°는 수학적 최적값이 아니라 경험적 절충값**이다.
+
+> 측정 주의: `ds[i]` 로 세면 `_rand_another` 때문에 "필터를 켰는데 박스가 늘어나는" 값이 나온다.
+> `ds.pipeline(ds.get_data_info(i))` 로 직접 호출해 우회하고, 증강 난수를 고정해 짝지어 비교할 것.
 
 ---
 

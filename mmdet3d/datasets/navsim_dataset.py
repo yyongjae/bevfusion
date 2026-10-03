@@ -228,38 +228,43 @@ class NavsimDataset(Custom3DDataset):
         lidar2ego[:3, 3] = info["lidar2ego_translation"]
         data["lidar2ego"] = lidar2ego
 
+        # The calibration is built even when no images are read: it is pure matrix
+        # arithmetic, and `ObjectFOVFilter` needs `lidar2image` to run in the
+        # LiDAR-only stage, whose pipeline never loads an image.  Only the paths
+        # are gated, since those are what the image loader consumes.
         if self.modality["use_camera"]:
             data["image_paths"] = []
-            data["lidar2camera"] = []
-            data["lidar2image"] = []
-            data["camera2ego"] = []
-            data["camera_intrinsics"] = []
-            data["camera2lidar"] = []
+        data["lidar2camera"] = []
+        data["lidar2image"] = []
+        data["camera2ego"] = []
+        data["camera_intrinsics"] = []
+        data["camera2lidar"] = []
 
-            for cam_name in self.camera_names:
-                cam = info["cams"][cam_name]
+        for cam_name in self.camera_names:
+            cam = info["cams"][cam_name]
+            if self.modality["use_camera"]:
                 data["image_paths"].append(self._abs(cam["data_path"]))
 
-                # NAVSIM gives camera -> LiDAR directly.
-                camera2lidar = np.eye(4).astype(np.float32)
-                camera2lidar[:3, :3] = cam["sensor2lidar_rotation"]
-                camera2lidar[:3, 3] = cam["sensor2lidar_translation"]
-                data["camera2lidar"].append(camera2lidar)
+            # NAVSIM gives camera -> LiDAR directly.
+            camera2lidar = np.eye(4).astype(np.float32)
+            camera2lidar[:3, :3] = cam["sensor2lidar_rotation"]
+            camera2lidar[:3, 3] = cam["sensor2lidar_translation"]
+            data["camera2lidar"].append(camera2lidar)
 
-                lidar2camera = np.linalg.inv(camera2lidar).astype(np.float32)
-                data["lidar2camera"].append(lidar2camera)
+            lidar2camera = np.linalg.inv(camera2lidar).astype(np.float32)
+            data["lidar2camera"].append(lidar2camera)
 
-                camera_intrinsics = np.eye(4).astype(np.float32)
-                camera_intrinsics[:3, :3] = cam["cam_intrinsic"]
-                data["camera_intrinsics"].append(camera_intrinsics)
+            camera_intrinsics = np.eye(4).astype(np.float32)
+            camera_intrinsics[:3, :3] = cam["cam_intrinsic"]
+            data["camera_intrinsics"].append(camera_intrinsics)
 
-                data["lidar2image"].append(camera_intrinsics @ lidar2camera)
+            data["lidar2image"].append(camera_intrinsics @ lidar2camera)
 
-                # lidar2ego is the identity in NAVSIM, so camera2ego == camera2lidar,
-                # but compose it explicitly to stay correct if that ever changes.
-                data["camera2ego"].append(
-                    (lidar2ego @ camera2lidar).astype(np.float32)
-                )
+            # lidar2ego is the identity in NAVSIM, so camera2ego == camera2lidar,
+            # but compose it explicitly to stay correct if that ever changes.
+            data["camera2ego"].append(
+                (lidar2ego @ camera2lidar).astype(np.float32)
+            )
 
         data["ann_info"] = self.get_ann_info(index)
         return data
@@ -345,8 +350,11 @@ class NavsimDataset(Custom3DDataset):
             box_yaw = -box3d.yaw.numpy() - np.pi / 2
 
             sample_token = self.data_infos[sample_id]["token"]
+            fov_mask = self._camera_fov_mask(self.data_infos[sample_id], box3d)
 
             for i in range(len(box3d)):
+                if not fov_mask[i]:
+                    continue
                 name = mapped_class_names[labels[i]]
                 center_x = box_gravity_center[i, 0].item()
                 center_y = box_gravity_center[i, 1].item()
@@ -396,36 +404,57 @@ class NavsimDataset(Custom3DDataset):
             )
         return result_files, tmp_dir
 
-    def _camera_fov_mask(self, info, gt_boxes):
-        """``(N,)`` mask of GT boxes seen by at least one configured camera.
+    def _camera_fov_mask(self, info, boxes):
+        """``(N,)`` mask of boxes inside the configured camera evaluation area.
 
         ``load_gt`` builds the evaluation GT straight from ``data_infos``,
         bypassing the pipeline, so ``ObjectFOVFilter`` never touches it.  Without
-        this the model would be scored on objects outside the camera rig's view
-        that the training targets no longer contain.  Controlled by
-        ``eval_cfg['camera_fov']``; absent or ``enabled: false`` keeps every box.
+        this mask on both GT and predictions, detections outside the camera rig's
+        view would still count as false positives even though matching GT was
+        removed. Controlled by ``eval_cfg['camera_fov']``; absent or
+        ``enabled: false`` keeps every box.
         """
         cfg = self.eval_cfg.get("camera_fov")
-        if not cfg or not cfg.get("enabled", False) or len(gt_boxes) == 0:
-            return np.ones(len(gt_boxes), dtype=bool)
+        if not cfg or not cfg.get("enabled", False) or len(boxes) == 0:
+            return np.ones(len(boxes), dtype=bool)
 
         cams = info.get("cams")
         if not cams or any(name not in cams for name in self.camera_names):
-            return np.ones(len(gt_boxes), dtype=bool)
+            return np.ones(len(boxes), dtype=bool)
 
         image_wh = cfg.get("image_wh") or image_size_from_intrinsics(
             cams, self.camera_names
         )
-        corners = LiDARInstance3DBoxes(
-            gt_boxes, box_dim=gt_boxes.shape[-1], origin=(0.5, 0.5, 0.5)
-        ).corners.numpy()
-        return boxes_in_view(
-            corners,
+        if isinstance(boxes, LiDARInstance3DBoxes):
+            box_corners = boxes.corners.numpy()
+            box_centres = boxes.gravity_center.numpy()
+        else:
+            boxes = np.asarray(boxes)
+            lidar_boxes = LiDARInstance3DBoxes(
+                boxes, box_dim=boxes.shape[-1], origin=(0.5, 0.5, 0.5)
+            )
+            box_corners = lidar_boxes.corners.numpy()
+            box_centres = lidar_boxes.gravity_center.numpy()
+
+        mask = boxes_in_view(
+            box_corners,
             build_lidar2image(cams, self.camera_names),
             tuple(image_wh),
             min_corners=cfg.get("min_visible_corners", 1),
             margin=cfg.get("margin", 0.0),
         )
+
+        apply_within = cfg.get("apply_within")
+        if apply_within is not None:
+            x_min, y_min, x_max, y_max = apply_within
+            considered = (
+                (box_centres[:, 0] >= x_min)
+                & (box_centres[:, 0] <= x_max)
+                & (box_centres[:, 1] >= y_min)
+                & (box_centres[:, 1] <= y_max)
+            )
+            mask |= ~considered
+        return mask
 
     def load_gt(self):
         """Build the GT :class:`EvalBoxes` from ``data_infos``."""
@@ -440,12 +469,16 @@ class NavsimDataset(Custom3DDataset):
             num_pts = np.asarray(
                 info.get("num_lidar_pts", np.full(len(gt_boxes), -1))
             ).reshape(-1)
+            if self.use_valid_flag and "valid_flag" in info:
+                valid_mask = np.asarray(info["valid_flag"], dtype=bool).reshape(-1)
+            else:
+                valid_mask = np.ones(len(gt_boxes), dtype=bool)
 
             fov_mask = self._camera_fov_mask(info, gt_boxes)
 
             for j in range(len(gt_boxes)):
                 class_name = gt_names[j]
-                if not fov_mask[j]:
+                if not valid_mask[j] or not fov_mask[j]:
                     continue
                 if not self._in_eval_range(
                     gt_boxes[j, 0], gt_boxes[j, 1], class_name

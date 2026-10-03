@@ -567,21 +567,35 @@ class ObjectFOVFilter:
             border -- still legitimate detection targets.
         margin (float): pixels of slack outside the image border.
         enabled (bool): set False to disable without editing the pipeline.
+        apply_within (sequence[float], optional): ``[x_min, y_min, x_max,
+            y_max]`` region in which to apply the visibility test. ``None``
+            filters every box.
+        image_wh (sequence[float], optional): stored ``(width, height)``. This
+            is required when no image is loaded and is preferred to inferring
+            a size from a potentially off-centre principal point.
     """
 
     def __init__(
-        self, min_visible_corners=1, margin=0.0, enabled=True, apply_within=None
+        self,
+        min_visible_corners=1,
+        margin=0.0,
+        enabled=True,
+        apply_within=None,
+        image_wh=None,
     ):
         self.min_visible_corners = int(min_visible_corners)
         self.margin = float(margin)
         self.enabled = bool(enabled)
+        # Stored image size, used when the pipeline loaded no image (the
+        # LiDAR-only stage).  Do not leave this to the principal point: NAVSIM's
+        # is not centred vertically (cy = 560 on 1080-row images), so 2 * cy
+        # overestimates the height by 40 px.
+        self.image_wh = None if image_wh is None else tuple(image_wh)
         # ``[x_min, y_min, x_max, y_max]``: restrict the filter to boxes whose
-        # centre falls in this BEV rectangle, leaving the rest untouched.  With
-        # ``bev_roi`` here the rear keeps its LiDAR-only supervision -- the
-        # dense heatmap stays supervised over the full 360 degrees, as
-        # docs/NAVSIM.md intends -- while the queried front region is trimmed to
-        # what the cameras actually see.  ``None`` filters everywhere, which
-        # makes the label set purely camera-conditioned.
+        # centre falls in this BEV rectangle, leaving the rest untouched. This
+        # can preserve rear LiDAR supervision on a 360-degree grid while
+        # trimming only its queried front region. ``None`` filters everywhere,
+        # which is appropriate for the current front-only NAVSIM grid.
         self.apply_within = (
             None if apply_within is None else np.asarray(apply_within, dtype=np.float64)
         )
@@ -589,17 +603,43 @@ class ObjectFOVFilter:
     def __call__(self, data):
         if not self.enabled:
             return data
-        if "gt_bboxes_3d" not in data or "lidar2image" not in data:
+        lidar2image = data.get("lidar2image")
+        if (
+            "gt_bboxes_3d" not in data
+            or lidar2image is None
+            or len(lidar2image) == 0
+        ):
+            return data
+        camera_intrinsics = data.get("camera_intrinsics")
+        has_intrinsics = camera_intrinsics is not None and len(camera_intrinsics) > 0
+        if (
+            "ori_shape" not in data
+            and self.image_wh is None
+            and not has_intrinsics
+        ):
             return data
 
         gt_bboxes_3d = data["gt_bboxes_3d"]
         if len(gt_bboxes_3d) == 0:
             return data
 
-        width, height = data["ori_shape"]
+        if "ori_shape" in data:
+            ori_shape = data["ori_shape"]
+            if len(ori_shape) == 2:
+                # This repository's multi-view loader stores PIL's (W, H).
+                width, height = ori_shape
+            else:
+                # Conventional ndarray image metadata is (H, W, C).
+                height, width = ori_shape[:2]
+        elif self.image_wh is not None:
+            width, height = self.image_wh
+        else:
+            K = np.asarray(camera_intrinsics[0], dtype=np.float64)
+            width, height = 2.0 * K[0, 2], 2.0 * K[1, 2]
+
         mask = boxes_in_view(
             gt_bboxes_3d.corners.numpy(),
-            np.asarray(data["lidar2image"], dtype=np.float64),
+            np.asarray(lidar2image, dtype=np.float64),
             (width, height),
             min_corners=self.min_visible_corners,
             margin=self.margin,
@@ -628,7 +668,7 @@ class ObjectFOVFilter:
             f"{self.__class__.__name__}("
             f"min_visible_corners={self.min_visible_corners}, "
             f"margin={self.margin}, enabled={self.enabled}, "
-            f"apply_within={self.apply_within})"
+            f"apply_within={self.apply_within}, image_wh={self.image_wh})"
         )
 
 

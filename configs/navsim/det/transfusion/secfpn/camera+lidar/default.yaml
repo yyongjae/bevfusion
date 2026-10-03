@@ -51,10 +51,10 @@ model:
         out_channels: 80
         image_size: ${image_size}
         feature_size: ${[image_size[0] // 8, image_size[1] // 8]}
-        # Front-only x, matching point_cloud_range. 32 m / 0.16 = 200 cells,
-        # halved by `downsample: 2` to the 100 the LiDAR branch produces; the
+        # Front-only x, matching point_cloud_range. 32 m / 0.32 = 100 cells,
+        # halved by `downsample: 2` to the 50 the LiDAR branch produces; the
         # lateral axis is unchanged at 64 m / 0.32 = 200 -> 100.
-        xbound: [0.0, 32.0, 0.16]
+        xbound: [0.0, 32.0, 0.32]
         ybound: [-32.0, 32.0, 0.32]
         zbound: [-10.0, 10.0, 20.0]
         dbound: [1.0, 50.0, 0.5]
@@ -71,7 +71,7 @@ model:
       backbone:
         type: SparseEncoder
         in_channels: ${use_dim}
-        sparse_shape: [800, 800, 41]
+        sparse_shape: [400, 800, 41]
         output_channels: 128
         order: [conv, norm, act]
         encoder_channels: [[16, 16, 32], [32, 32, 64], [64, 64, 128], [128, 128]]
@@ -126,7 +126,7 @@ model:
       train_cfg:
         dataset: NAVSIM
         point_cloud_range: ${point_cloud_range}
-        grid_size: [800, 800, 41]
+        grid_size: [400, 800, 41]
         voxel_size: ${voxel_size}
         out_size_factor: 8
         gaussian_overlap: 0.1
@@ -152,7 +152,7 @@ model:
       test_cfg:
         dataset: NAVSIM
         bev_roi: ${bev_roi}
-        grid_size: [800, 800, 41]
+        grid_size: [400, 800, 41]
         out_size_factor: 8
         voxel_size: ${voxel_size[:2]}
         pc_range: ${point_cloud_range[:2]}

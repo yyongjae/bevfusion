@@ -30,7 +30,12 @@ train_pipeline:
     load_augmented: ${load_augmented}
   -
     type: LoadPointsFromMultiSweeps
-    sweeps_num: 0
+    # Inherited from the Bench2Drive port, which accumulates no sweeps. NAVSIM
+    # does (docs/NAVSIM.md section 4), and stage 2 loads this checkpoint, so
+    # leaving it at 0 would pretrain the sparse encoder on 52k points per sample
+    # with a constant-zero time channel and then hand it 133k points carrying
+    # real offsets.
+    sweeps_num: ${sweeps_num}
     load_dim: ${load_dim}
     use_dim: ${use_dim}
     reduce_beams: ${reduce_beams}
@@ -43,6 +48,16 @@ train_pipeline:
     with_label_3d: true
     with_attr_label: False
   -
+    # Same camera-visibility filter the fusion stage uses, so stage 1 is
+    # initialised on the label set stage 2 is trained against. No image is
+    # loaded here; the dataset supplies the calibration regardless.
+    type: ObjectFOVFilter
+    min_visible_corners: ${camera_fov.min_visible_corners}
+    margin: ${camera_fov.margin}
+    enabled: ${camera_fov.enabled}
+    apply_within: ${camera_fov.apply_within}
+    image_wh: ${camera_fov.image_wh}
+  -
     type: GlobalRotScaleTrans
     resize_lim: ${augment3d.scale}
     rot_lim: ${augment3d.rotate}
@@ -50,6 +65,11 @@ train_pipeline:
     is_train: true
   -
     type: RandomFlip3D
+    # Match stage 2: x -> -x would move camera-invisible rear objects into the
+    # fixed front-only BEV after ObjectFOVFilter has removed their labels.
+    # Lateral mirroring remains valid because both the rig and ROI are
+    # left/right symmetric.
+    vertical: false
   -
     type: PointsRangeFilter
     point_cloud_range: ${point_cloud_range}
@@ -84,7 +104,12 @@ test_pipeline:
     load_augmented: ${load_augmented}
   -
     type: LoadPointsFromMultiSweeps
-    sweeps_num: 0
+    # Inherited from the Bench2Drive port, which accumulates no sweeps. NAVSIM
+    # does (docs/NAVSIM.md section 4), and stage 2 loads this checkpoint, so
+    # leaving it at 0 would pretrain the sparse encoder on 52k points per sample
+    # with a constant-zero time channel and then hand it 133k points carrying
+    # real offsets.
+    sweeps_num: ${sweeps_num}
     load_dim: ${load_dim}
     use_dim: ${use_dim}
     reduce_beams: ${reduce_beams}
@@ -131,7 +156,7 @@ model:
       backbone:
         type: SparseEncoder
         in_channels: ${use_dim}
-        sparse_shape: [800, 800, 41]
+        sparse_shape: [400, 800, 41]
         output_channels: 128
         order: [conv, norm, act]
         encoder_channels: [[16, 16, 32], [32, 32, 64], [64, 64, 128], [128, 128]]
@@ -183,7 +208,7 @@ model:
       train_cfg:
         dataset: NAVSIM
         point_cloud_range: ${point_cloud_range}
-        grid_size: [800, 800, 41]
+        grid_size: [400, 800, 41]
         voxel_size: ${voxel_size}
         out_size_factor: 8
         gaussian_overlap: 0.1
@@ -209,7 +234,7 @@ model:
       test_cfg:
         dataset: NAVSIM
         bev_roi: ${bev_roi}
-        grid_size: [800, 800, 41]
+        grid_size: [400, 800, 41]
         out_size_factor: 8
         voxel_size: ${voxel_size[:2]}
         pc_range: ${point_cloud_range[:2]}

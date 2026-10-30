@@ -1,0 +1,66 @@
+# ============================================================
+# BEVFusion | NAVSIM | Camera+LiDAR | front-3 cameras | 64 m forward
+# ============================================================
+# Same teacher as swint_convfuser.yaml (front-3 cameras, 0.64 m square cells),
+# with the forward range doubled:
+#
+#   x_forward in [0, 64] m, y_left in [-32, 32] m  ->  100 x 100 BEV, 0.64 m cells
+#
+# Only range/grid-dependent keys change; everything else is inherited from
+# configs/navsim/default.yaml and camera+lidar/default.yaml.
+#   voxel_size [0.08, 0.08, 0.2] (unchanged) -> sparse_shape / grid_size
+#     [800, 800, 41], out_size_factor 8 -> 100 x 100 head grid
+#   camera xbound [0, 64, 0.32] / ybound [-32, 32, 0.32], downsample 2 -> 100 x 100
+#   dbound up to 72 m: the far corner (64, +-32) is ~71.6 m from the rig
+#   post_center_range x_max 69 (the 50 x 100 value, 37, would drop every box
+#     decoded beyond x = 37)
+#   max_voxels [160000, 160000]: worst-case training aug reaches ~115k-116k
+#     non-empty voxels at 64 m (96% of the old 120k train cap)
+#   eval class_range is per-axis [|x|, |y|] (NavsimDataset._in_eval_range), so
+#     [64, 32] scores the whole grid
+#
+# Stage 1 (LiDAR-only, same range):
+#   configs/navsim/det/transfusion/secfpn/lidar/voxelnet_64m.yaml
+# Launcher for both stages: train_navsim_64m.sh
+# ============================================================
+
+max_epochs: 20
+
+point_cloud_range: [0.0, -32.0, -3.0, 64.0, 32.0, 5.0]
+
+eval_cfg:
+  point_cloud_range: [0.0, -32.0, -3.0, 64.0, 32.0, 5.0]
+  class_range:
+    vehicle: [64, 32]
+    pedestrian: [64, 32]
+    bicycle: [64, 32]
+    traffic_cone: [64, 32]
+    barrier: [64, 32]
+    czone_sign: [64, 32]
+    generic_object: [64, 32]
+
+camera_names:
+  - CAM_F0
+  - CAM_L0
+  - CAM_R0
+
+model:
+  encoders:
+    camera:
+      vtransform:
+        xbound: [0.0, 64.0, 0.32]
+        ybound: [-32.0, 32.0, 0.32]
+        dbound: [1.0, 72.0, 0.5]
+    lidar:
+      voxelize:
+        max_voxels: [160000, 160000]
+      backbone:
+        sparse_shape: [800, 800, 41]
+  heads:
+    object:
+      train_cfg:
+        grid_size: [800, 800, 41]
+      test_cfg:
+        grid_size: [800, 800, 41]
+      bbox_coder:
+        post_center_range: [-37.0, -37.0, -10.0, 69.0, 37.0, 10.0]

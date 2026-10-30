@@ -1,0 +1,311 @@
+# ============================================================
+# BEVFusion | NAVSIM | LiDAR-only | TransFusion | 64 m forward
+# ============================================================
+# Stage 1 for camera+lidar/swint_convfuser_64m.yaml. Identical to
+# voxelnet.yaml except for the range/grid keys:
+#   point_cloud_range [0, -32, -3, 64, 32, 5]  (x forward 0-64 m, y +-32 m)
+#   sparse_shape / grid_size [800, 800, 41]    (0.08 m voxels, unchanged)
+#   -> 100 x 100 head grid, 0.64 m square cells
+#   post_center_range x_max 69, eval point_cloud_range / class_range [64, 32]
+#   max_voxels [160000, 160000]: worst-case training aug reaches ~115k-116k
+#     non-empty voxels at 64 m (96% of the old 120k train cap)
+# torchpack cannot include a sibling file, so the model block is a copy of
+# voxelnet.yaml; keep the two in sync.
+#
+#   torchpack dist-run -np 4 python tools/train.py \
+#       configs/navsim/det/transfusion/secfpn/lidar/voxelnet_64m.yaml \
+#       --run-dir runs/navsim-lidar-only-64m
+# (or ./train_navsim_64m.sh, which chains stage 2)
+# ============================================================
+
+point_cloud_range: [0.0, -32.0, -3.0, 64.0, 32.0, 5.0]
+
+eval_cfg:
+  point_cloud_range: [0.0, -32.0, -3.0, 64.0, 32.0, 5.0]
+  class_range:
+    vehicle: [64, 32]
+    pedestrian: [64, 32]
+    bicycle: [64, 32]
+    traffic_cone: [64, 32]
+    barrier: [64, 32]
+    czone_sign: [64, 32]
+    generic_object: [64, 32]
+
+max_epochs: 20
+
+input_modality:
+  use_lidar: true
+  use_camera: false
+  use_radar: false
+  use_map: false
+  use_external: false
+
+train_pipeline:
+  -
+    type: LoadPointsFromFile
+    coord_type: LIDAR
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    load_augmented: ${load_augmented}
+  -
+    type: LoadPointsFromMultiSweeps
+    # Inherited from the Bench2Drive port, which accumulates no sweeps. NAVSIM
+    # does (docs/NAVSIM.md section 4), and stage 2 loads this checkpoint, so
+    # leaving it at 0 would pretrain the sparse encoder on 52k points per sample
+    # with a constant-zero time channel and then hand it 133k points carrying
+    # real offsets.
+    sweeps_num: ${sweeps_num}
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    pad_empty_sweeps: true
+    remove_close: true
+    load_augmented: ${load_augmented}
+  -
+    type: LoadAnnotations3D
+    with_bbox_3d: true
+    with_label_3d: true
+    with_attr_label: False
+  -
+    # Same camera-visibility filter the fusion stage uses, so stage 1 is
+    # initialised on the label set stage 2 is trained against. No image is
+    # loaded here; the dataset supplies the calibration regardless.
+    type: ObjectFOVFilter
+    min_visible_corners: ${camera_fov.min_visible_corners}
+    margin: ${camera_fov.margin}
+    enabled: ${camera_fov.enabled}
+    apply_within: ${camera_fov.apply_within}
+    image_wh: ${camera_fov.image_wh}
+  -
+    type: GlobalRotScaleTrans
+    resize_lim: ${augment3d.scale}
+    rot_lim: ${augment3d.rotate}
+    trans_lim: ${augment3d.translate}
+    is_train: true
+  -
+    type: RandomFlip3D
+    # Match stage 2: x -> -x would move camera-invisible rear objects into the
+    # fixed front-only BEV after ObjectFOVFilter has removed their labels.
+    # Lateral mirroring remains valid because both the rig and ROI are
+    # left/right symmetric.
+    vertical: false
+  -
+    type: PointsRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ObjectRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ObjectNameFilter
+    classes: ${object_classes}
+  -
+    type: PointShuffle
+  -
+    type: DefaultFormatBundle3D
+    classes: ${object_classes}
+  -
+    type: Collect3D
+    keys:
+      - points
+      - gt_bboxes_3d
+      - gt_labels_3d
+    meta_keys:
+      - lidar2ego
+      - lidar_aug_matrix
+
+test_pipeline:
+  -
+    type: LoadPointsFromFile
+    coord_type: LIDAR
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    load_augmented: ${load_augmented}
+  -
+    type: LoadPointsFromMultiSweeps
+    # Inherited from the Bench2Drive port, which accumulates no sweeps. NAVSIM
+    # does (docs/NAVSIM.md section 4), and stage 2 loads this checkpoint, so
+    # leaving it at 0 would pretrain the sparse encoder on 52k points per sample
+    # with a constant-zero time channel and then hand it 133k points carrying
+    # real offsets.
+    sweeps_num: ${sweeps_num}
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    pad_empty_sweeps: true
+    remove_close: true
+    load_augmented: ${load_augmented}
+  -
+    type: LoadAnnotations3D
+    with_bbox_3d: true
+    with_label_3d: true
+    with_attr_label: False
+  -
+    type: GlobalRotScaleTrans
+    resize_lim: [1.0, 1.0]
+    rot_lim: [0.0, 0.0]
+    trans_lim: 0.0
+    is_train: false
+  -
+    type: PointsRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: DefaultFormatBundle3D
+    classes: ${object_classes}
+  -
+    type: Collect3D
+    keys:
+      - points
+      - gt_bboxes_3d
+      - gt_labels_3d
+    meta_keys:
+      - lidar2ego
+      - lidar_aug_matrix
+
+model:
+  type: BEVFusion
+  encoders:
+    camera: null
+    lidar:
+      voxelize:
+        max_num_points: 10
+        point_cloud_range: ${point_cloud_range}
+        voxel_size: ${voxel_size}
+        max_voxels: [160000, 160000]
+      backbone:
+        type: SparseEncoder
+        in_channels: ${use_dim}
+        sparse_shape: [800, 800, 41]
+        output_channels: 128
+        order: [conv, norm, act]
+        encoder_channels: [[16, 16, 32], [32, 32, 64], [64, 64, 128], [128, 128]]
+        encoder_paddings: [[0, 0, 1], [0, 0, 1], [0, 0, [1, 1, 0]], [0, 0]]
+        block_type: basicblock
+  fuser: null
+  decoder:
+    backbone:
+      type: SECOND
+      in_channels: 256
+      out_channels: [128, 256]
+      layer_nums: [5, 5]
+      layer_strides: [1, 2]
+      norm_cfg:
+        type: BN
+        eps: 1.0e-3
+        momentum: 0.01
+      conv_cfg:
+        type: Conv2d
+        bias: false
+    neck:
+      type: SECONDFPN
+      in_channels: [128, 256]
+      out_channels: [256, 256]
+      upsample_strides: [1, 2]
+      norm_cfg:
+        type: BN
+        eps: 1.0e-3
+        momentum: 0.01
+      upsample_cfg:
+        type: deconv
+        bias: false
+      use_conv_for_no_stride: true
+  heads:
+    object:
+      type: TransFusionHead
+      num_proposals: 200
+      auxiliary: true
+      in_channels: 512
+      hidden_channel: 128
+      num_classes: 7
+      num_decoder_layers: 1
+      num_heads: 8
+      nms_kernel_size: 3
+      ffn_channel: 256
+      dropout: 0.1
+      bn_momentum: 0.1
+      activation: relu
+      train_cfg:
+        dataset: NAVSIM
+        point_cloud_range: ${point_cloud_range}
+        grid_size: [800, 800, 41]
+        voxel_size: ${voxel_size}
+        out_size_factor: 8
+        gaussian_overlap: 0.1
+        min_radius: 2
+        pos_weight: -1
+        code_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+        assigner:
+          type: HungarianAssigner3D
+          iou_calculator:
+            type: BboxOverlaps3D
+            coordinate: lidar
+          cls_cost:
+            type: FocalLossCost
+            gamma: 2.0
+            alpha: 0.25
+            weight: 0.15
+          reg_cost:
+            type: BBoxBEVL1Cost
+            weight: 0.25
+          iou_cost:
+            type: IoU3DCost
+            weight: 0.25
+      test_cfg:
+        dataset: NAVSIM
+        bev_roi: ${bev_roi}
+        grid_size: [800, 800, 41]
+        out_size_factor: 8
+        voxel_size: ${voxel_size[:2]}
+        pc_range: ${point_cloud_range[:2]}
+        nms_type: null
+      common_heads:
+        center: [2, 2]
+        height: [1, 2]
+        dim: [3, 2]
+        rot: [2, 2]
+        vel: [2, 2]
+      bbox_coder:
+        type: TransFusionBBoxCoder
+        pc_range: ${point_cloud_range[:2]}
+        post_center_range: [-37.0, -37.0, -10.0, 69.0, 37.0, 10.0]
+        score_threshold: 0.0
+        out_size_factor: 8
+        voxel_size: ${voxel_size[:2]}
+        code_size: 10
+      loss_cls:
+        type: FocalLoss
+        use_sigmoid: true
+        gamma: 2.0
+        alpha: 0.25
+        reduction: mean
+        loss_weight: 1.0
+      loss_heatmap:
+        type: GaussianFocalLoss
+        reduction: mean
+        loss_weight: 1.0
+      loss_bbox:
+        type: L1Loss
+        reduction: mean
+        loss_weight: 0.25
+    map: null
+
+optimizer:
+  type: AdamW
+  lr: 1.0e-4
+  weight_decay: 0.01
+
+optimizer_config:
+  grad_clip:
+    max_norm: 35
+    norm_type: 2
+
+lr_config:
+  policy: cyclic
+
+momentum_config:
+  policy: cyclic
+
+data:
+  samples_per_gpu: 4
+  workers_per_gpu: 4
